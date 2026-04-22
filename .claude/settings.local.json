@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python verify_fork.py)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from server.demo_server import app; print\\('Server imports OK'\\)\")",
+      "Bash(timeout 3 python -m uvicorn server.demo_server:app --host 0.0.0.0 --port 8765)",
+      "Bash(python -m uvicorn server.demo_server:app --port 8765)",
+      "Bash(curl -s http://localhost:8765/)",
+      "Bash(python -m uvicorn server.demo_server:app --port 8765 --host 0.0.0.0)",
+      "Bash(curl:*)",
+      "Bash(python -c ':*)",
+      "Bash(timeout 5 python -c ':*)"
+    ]
+  }
+}

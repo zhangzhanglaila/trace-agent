@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AgentTrace - Time Travel Debug</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        /* B站风格：深色有能量背景 */
+        body {
+            background: radial-gradient(circle at top, #1a1c2e, #0b0d14);
+            color: #fff;
+            font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* 心理锚点 - 发光效果 */
+        #edit-indicator {
+            position: fixed;
+            top: 80px;
+            left: 20px;
+            background: linear-gradient(135deg, rgba(255,59,107,0.95), rgba(180,40,80,0.95));
+            color: #fff;
+            padding: 14px 24px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            z-index: 1000;
+            opacity: 0;
+            transform: translateX(-120px);
+            transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+            box-shadow: 0 0 40px rgba(255,59,107,0.6);
+        }
+        #edit-indicator.visible {
+            opacity: 1;
+            transform: translateX(0);
+            animation: editPulse 1.5s ease-in-out infinite;
+        }
+        @keyframes editPulse {
+            0%, 100% { box-shadow: 0 0 40px rgba(255,59,107,0.6); }
+            50% { box-shadow: 0 0 60px rgba(255,59,107,0.9); }
+        }
+
+        /* 屏幕震动 */
+        @keyframes screenShake {
+            0%, 100% { transform: translateX(0); }
+            10%, 30%, 50%, 70%, 90% { transform: translateX(-6px); }
+            20%, 40%, 60%, 80% { transform: translateX(6px); }
+        }
+        body.shake {
+            animation: screenShake 0.6s ease-in-out;
+        }
+
+        /* CRITICAL 红屏脉冲 */
+        #critical-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle, transparent 20%, rgba(255,59,107,0.35) 100%);
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 999;
+        }
+        #critical-overlay.active {
+            opacity: 1;
+            animation: criticalPulse 0.8s ease-in-out infinite;
+        }
+        @keyframes criticalPulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+
+        /* 毛玻璃 header */
+        .header {
+            background: rgba(20, 22, 35, 0.85);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            padding: 16px 32px;
+        }
+        .header h1 {
+            font-size: 1.3rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #00e5ff, #8a5cff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .controls { display: flex; gap: 12px; margin-top: 12px; }
+
+        /* 按钮：发光边框风格 */
+        button {
+            background: rgba(25, 28, 45, 0.9);
+            border: 1px solid rgba(0,229,255,0.4);
+            color: #00e5ff;
+            padding: 10px 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.25s ease;
+        }
+        button:hover:not(:disabled) {
+            background: rgba(0,229,255,0.15);
+            border-color: #00e5ff;
+            box-shadow: 0 0 20px rgba(0,229,255,0.3);
+        }
+        button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+        /* 主按钮：渐变发光 */
+        button.primary {
+            background: linear-gradient(135deg, #00e5ff, #8a5cff);
+            border: none;
+            color: #fff;
+            font-weight: 600;
+            box-shadow: 0 0 25px rgba(0,229,255,0.4);
+        }
+        button.primary:hover:not(:disabled) {
+            box-shadow: 0 0 35px rgba(0,229,255,0.6);
+        }
+
+        /* 危险按钮：红色发光 */
+        button.danger {
+            background: linear-gradient(135deg, #ff3b6b, #cc2d56);
+            border: none;
+            color: #fff;
+            font-weight: 600;
+            box-shadow: 0 0 25px rgba(255,59,107,0.5);
+        }
+        button.danger:hover:not(:disabled) {
+            box-shadow: 0 0 40px rgba(255,59,107,0.7);
+        }
+
+        .main-container { display: flex; height: calc(100vh - 80px); }
+        #graph-container { flex: 1; position: relative; }
+        #graph { width: 100%; height: 100%; }
+
+        /* 节点：发光效果 */
+        .node { cursor: pointer; transition: all 0.3s ease; }
+        .node:hover { filter: brightness(1.2); }
+        .node.tool_result { fill: #00e5ff; filter: drop-shadow(0 0 8px rgba(0,229,255,0.5)); }
+        .node.forked { fill: #00ff94; filter: drop-shadow(0 0 12px rgba(0,255,148,0.6)); } /* 荧光绿 */
+        .node.critical { fill: #ff3b6b; filter: drop-shadow(0 0 15px rgba(255,59,107,0.7)); }
+        .node.original-dimmed { opacity: 0.25; filter: blur(2px) grayscale(100%); }
+        .node-label { fill: #fff; font-size: 11px; text-anchor: middle; pointer-events: none; font-weight: 500; }
+
+        /* 毛玻璃 inspector 面板 */
+        .inspector {
+            width: 360px;
+            background: rgba(18, 20, 30, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-left: 1px solid rgba(255,255,255,0.06);
+            padding: 24px;
+            border-radius: 16px 0 0 16px;
+        }
+        .inspector h3 {
+            color: #00e5ff;
+            margin-bottom: 16px;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+        }
+        .inspector-content {
+            background: rgba(26, 28, 40, 0.8);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .inspector-content pre {
+            font-size: 0.75rem;
+            white-space: pre-wrap;
+            word-break: break-all;
+            color: #a8b2c8;
+        }
+        textarea {
+            width: 100%;
+            background: rgba(15, 17, 25, 0.9);
+            border: 1px solid rgba(0,229,255,0.3);
+            color: #00e5ff;
+            padding: 12px;
+            border-radius: 10px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            resize: vertical;
+            min-height: 70px;
+            transition: all 0.25s ease;
+        }
+        textarea:focus {
+            outline: none;
+            border-color: #00e5ff;
+            box-shadow: 0 0 15px rgba(0,229,255,0.25);
+        }
+
+        /* 分叉动画 */
+        @keyframes forkGrow { from { transform: scale(0); opacity: 0; } 50% { transform: scale(1.15); } to { transform: scale(1); opacity: 1; } }
+        @keyframes originalFade { to { opacity: 0.15; filter: blur(4px) grayscale(100%); } }
+        @keyframes lockIn { 0% { opacity: 0; transform: scale(2.5); } 100% { opacity: 1; transform: scale(1); } }
+
+        .forked-node {
+            animation: forkGrow 0.7s cubic-bezier(0.34, 1.56, 0.64, 1), dropShadowGlow 1.8s ease-in-out infinite;
+        }
+        .original-dimmed { animation: originalFade 0.6s ease-out forwards; }
+
+        @keyframes dropShadowGlow {
+            0%, 100% { filter: drop-shadow(0 0 15px #00ff94); }
+            50% { filter: drop-shadow(0 0 35px #00ff94); }
+        }
+
+        /* 锁定遮罩 */
+        .locked-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(5, 6, 12, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.6s;
+            z-index: 100;
+        }
+        .locked-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+        .locked-message {
+            background: linear-gradient(145deg, rgba(25,28,50,0.98), rgba(12,14,22,0.98));
+            border: 1px solid rgba(255,59,107,0.4);
+            padding: 40px 60px;
+            border-radius: 16px;
+            text-align: center;
+            animation: lockIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+            box-shadow: 0 0 60px rgba(255,59,107,0.3);
+        }
+        .locked-message h2 {
+            color: #ff3b6b;
+            font-size: 1.6rem;
+            margin-bottom: 12px;
+            font-weight: 700;
+        }
+        .locked-message p {
+            color: #8a94a8;
+            font-size: 0.95rem;
+        }
+
+        /* 状态栏 */
+        .status {
+            font-size: 0.75rem;
+            color: #5a6478;
+            padding: 12px 32px;
+            background: rgba(8, 10, 16, 0.9);
+            border-top: 1px solid rgba(255,255,255,0.04);
+        }
+        .status span { color: #00e5ff; }
+        .status.critical span { color: #ff3b6b; }
+
+        /* 输入框 */
+        input[type="text"] {
+            background: rgba(15, 17, 25, 0.9);
+            border: 1px solid rgba(138, 92, 255, 0.3);
+            color: #fff;
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 0.9rem;
+            width: 260px;
+            transition: all 0.25s ease;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #8a5cff;
+            box-shadow: 0 0 15px rgba(138,92,255,0.3);
+        }
+
+        .run-section { display: flex; gap: 10px; align-items: center; }
+    </style>
+</head>
+<body>
+    <!-- Critical overlay for visual disaster -->
+    <div id="critical-overlay"></div>
+
+    <!-- Edit indicator - YOU ARE EDITING REALITY -->
+    <div id="edit-indicator">YOU ARE EDITING AI REALITY</div>
+
+    <div class="header">
+        <h1>AgentTrace - Time Travel Debug</h1>
+        <div class="controls">
+            <button id="pauseBtn" onclick="pause()" disabled>⏸ Pause</button>
+            <button id="resumeBtn" onclick="resume()" disabled>▶ Resume</button>
+            <div class="run-section">
+                <input type="text" id="queryInput" value="Patient has mild discomfort" />
+                <button id="runBtn" onclick="runAgent()">▶ Run Agent</button>
+            </div>
+        </div>
+    </div>
+    <div class="main-container">
+        <div id="graph-container">
+            <svg id="graph"></svg>
+            <!-- Locked overlay - appears after fork -->
+            <div id="locked-overlay" class="locked-overlay">
+                <div class="locked-message">
+                    <h2>⚠️ REALITY HAS SPLIT</h2>
+                    <p>Original path is now locked. You changed the past.</p>
+                </div>
+            </div>
+        </div>
+        <div class="inspector">
+            <h3>Node Inspector</h3>
+            <div id="selected-node" class="inspector-content"><p style="color:#5a6478;">Click a node to inspect</p></div>
+            <button id="rerunBtn" class="primary danger" onclick="modifyAndRerun()" disabled>⚠️ MODIFY WORLD & RE-RUN</button>
+        </div>
+    </div>
+    <div class="status" id="status-bar">Status: <span id="statusText">Ready - Click "Run Agent" to start</span></div>
+
+    <script>
+        let nodes = [], edges = [], isPaused = false, selectedNode = null, ws = null;
+        let isLocked = false;
+        let isCritical = false;
+        let forkAtStep = -1;
+        let forkId = null;
+        let rendering = false;
+
+        const svg = d3.select("#graph"), g = svg.append("g");
+        svg.attr("viewBox", `0 0 ${window.innerWidth * 0.65} 600`);
+        svg.call(d3.zoom().scaleExtent([0.2, 3]).on("zoom", e => g.attr("transform", e.transform)));
+
+        function connect() {
+            const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+            ws.onopen = () => document.getElementById("statusText").textContent = "Connected - Ready";
+            ws.onmessage = e => handleEvent(JSON.parse(e.data));
+            ws.onclose = () => document.getElementById("statusText").textContent = "Disconnected";
+        }
+
+        function handleEvent(data) {
+            if (data.type === "event") {
+                addEvent(data.event);
+                render();
+
+                if (data.event.type === "tool_result" && data.event.data.result === "CASE_CRITICAL") {
+                    triggerCriticalState();
+                }
+            }
+            else if (data.type === "pause") { isPaused = true; updateControls(); }
+            else if (data.type === "resume") { isPaused = false; updateControls(); }
+            else if (data.type === "fork_created") {
+                animateFork(data.fork_id, data.fork_at_step);
+            }
+        }
+
+        function addEvent(event) {
+            const isForkedEvent = forkAtStep !== -1 && event.step >= forkAtStep;
+            const prefix = isForkedEvent ? `${forkId}_` : '';
+            const nodeId = `${prefix}s${event.step}`;
+            const prevId = `${prefix}s${event.step - 1}`;
+
+            nodes.push({ id: nodeId, step: event.step, type: event.type, data: event.data, forked: isForkedEvent, isCritical: event.data.result === "CASE_CRITICAL" });
+            if (event.step > 0) edges.push({ from: prevId, to: nodeId, forked: isForkedEvent });
+        }
+
+        function render() {
+            if (rendering) return;
+            rendering = true;
+
+            requestAnimationFrame(() => {
+                const h = 60, w = 140, pad = 60;
+                nodes.forEach((n, i) => { n.x = window.innerWidth * 0.65 / 2; n.y = pad + i * h; n.w = w; n.h = 40; });
+
+                const sel = g.selectAll(".node").data(nodes, d => d.id);
+                sel.exit().remove();
+
+                const enter = sel.enter().append("g")
+                    .attr("class", d => {
+                        let cls = `node ${d.type}`;
+                        if (d.forked) cls += ' forked forked-node';
+                        else if (d.isCritical) cls += ' critical';
+                        if (d.isOriginalDimmed) cls += ' original-dimmed';
+                        return cls;
+                    })
+                    .attr("transform", d => `translate(${d.x - d.w/2}, ${d.y - d.h/2})`)
+                    .on("click", (_, d) => selectNode(d));
+
+                enter.append("rect").attr("width", d => d.w).attr("height", d => d.h).attr("rx", 10);
+                enter.append("text").attr("class", "node-label").attr("y", 25).attr("x", d => d.w/2)
+                    .text(d => {
+                        if (d.type === "tool_result" && d.data.result === "CASE_CRITICAL") return "CRITICAL!";
+                        if (d.type === "tool_result" && d.data.result === "CASE_NORMAL") return "NORMAL";
+                        return d.type.replace("_", " ").toUpperCase();
+                    });
+
+                const edgeSel = g.selectAll(".edge").data(edges, d => `${d.from}-${d.to}`);
+                edgeSel.enter().append("path").attr("class", d => `edge${d.forked ? ' forked' : ''}`).attr("d", d => {
+                    const f = nodes.find(n => n.id === d.from), t = nodes.find(n => n.id === d.to);
+                    return f && t ? `M${f.x},${f.y+f.h/2}L${t.x},${t.y-t.h/2}` : "";
+                });
+
+                rendering = false;
+            });
+        }
+
+        function selectNode(node) {
+            if (isLocked) return;
+
+            selectedNode = node;
+            const isToolResult = node.type === "tool_result";
+
+            document.getElementById("rerunBtn").disabled = !isToolResult || isLocked;
+
+            let html = `<p><strong>${node.type.toUpperCase()}</strong> (Step ${node.step})</p><pre>${JSON.stringify(node.data, null, 2)}</pre>`;
+
+            if (isToolResult) {
+                const isCrit = node.data.result === "CASE_CRITICAL";
+                const bgColor = isCrit ? "rgba(255,59,107,0.15)" : "rgba(0,229,255,0.1)";
+                const borderColor = isCrit ? "#ff3b6b" : "#00e5ff";
+                html = `<div style="background:${bgColor};border:1px solid ${borderColor};border-radius:10px;padding:12px;margin-bottom:10px;">
+                    <strong style="color:${isCrit ? '#ff3b6b' : '#00e5ff'}">${isCrit ? 'CRITICAL CASE' : 'NORMAL CASE'}</strong>
+                    <pre style="margin-top:8px">${JSON.stringify(node.data, null, 2)}</pre>
+                </div>` + (isToolResult ? `<p style="margin-top:12px;font-size:0.7rem;color:#5a6478;">Change the result above and click "MODIFY WORLD"</p>` : '');
+            }
+
+            document.getElementById("selected-node").innerHTML = html;
+        }
+
+        function triggerCriticalState() {
+            isCritical = true;
+
+            document.body.classList.add('shake');
+            setTimeout(() => document.body.classList.remove('shake'), 600);
+
+            document.getElementById('critical-overlay').classList.add('active');
+            setTimeout(() => document.getElementById('critical-overlay').classList.remove('active'), 2500);
+
+            document.getElementById('edit-indicator').classList.add('visible');
+            setTimeout(() => document.getElementById('edit-indicator').classList.remove('visible'), 3500);
+        }
+
+        function animateFork(id, atStep) {
+            forkId = id;
+            forkAtStep = atStep;
+
+            nodes.forEach(n => {
+                if (n.step > atStep) {
+                    n.isOriginalDimmed = true;
+                }
+            });
+
+            nodes.forEach(n => {
+                if (n.step > atStep) {
+                    n.forked = true;
+                }
+            });
+
+            isLocked = true;
+
+            document.getElementById('locked-overlay').classList.add('active');
+            document.getElementById('statusText').textContent = "REALITY SPLIT - Original path locked";
+            document.getElementById('status-bar').classList.add('critical');
+
+            render();
+            document.getElementById('rerunBtn').disabled = true;
+        }
+
+        function resetForkState() {
+            forkId = null;
+            forkAtStep = -1;
+            isLocked = false;
+            isCritical = false;
+            nodes = [];
+            edges = [];
+            document.getElementById('locked-overlay').classList.remove('active');
+            document.getElementById('edit-indicator').classList.remove('visible');
+            document.getElementById('status-bar').classList.remove('critical');
+        }
+
+        function pause() { fetch("/api/pause", {method: "POST"}); }
+        function resume() { fetch("/api/resume", {method: "POST"}); }
+
+        async function runAgent() {
+            if (isLocked) return;
+            resetForkState();
+
+            const query = document.getElementById("queryInput").value;
+            document.getElementById("statusText").textContent = "Running agent...";
+            document.getElementById("runBtn").disabled = true;
+            document.getElementById("pauseBtn").disabled = false;
+
+            try {
+                const response = await fetch("/api/run_agent", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ query })
+                });
+                const result = await response.json();
+                document.getElementById("statusText").textContent = "Agent completed: " + result.result;
+            } catch (e) {
+                document.getElementById("statusText").textContent = "Error: " + e.message;
+            } finally {
+                document.getElementById("runBtn").disabled = false;
+            }
+        }
+
+        function modifyAndRerun() {
+            if (!selectedNode || selectedNode.type !== "tool_result" || isLocked) return;
+
+            const output = document.querySelector("textarea")?.value || selectedNode.data.result;
+
+            document.getElementById('edit-indicator').classList.add('visible');
+
+            fetch("/api/modify_and_replay", {method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({fork_at_step: selectedNode.step, tool_output: output})});
+        }
+
+        function updateControls() {
+            document.getElementById("pauseBtn").disabled = isPaused || isLocked;
+            document.getElementById("resumeBtn").disabled = !isPaused || isLocked;
+        }
+
+        connect();
+    </script>
+</body>
+</html>

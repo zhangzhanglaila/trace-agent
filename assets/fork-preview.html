@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AgentTrace - Fork Animation Preview</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0b0d14; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: monospace; overflow: hidden; }
+        .header { position: absolute; top: 20px; left: 30px; }
+        .header h1 { font-size: 1.1rem; background: linear-gradient(90deg, #00e5ff, #8a5cff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .step { position: absolute; color: #fff; font-size: 0.8rem; padding: 6px 14px; background: rgba(0,229,255,0.15); border: 1px solid rgba(0,229,255,0.3); border-radius: 6px; opacity: 0; transition: opacity 0.5s; }
+        .step.active { opacity: 1; }
+        .timeline { position: relative; width: 500px; height: 380px; }
+        .node { position: absolute; width: 120px; height: 40px; background: rgba(20,25,45,0.9); border: 1px solid rgba(0,229,255,0.4); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #00e5ff; font-size: 0.75rem; opacity: 0; transform: scale(0.5); transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1); }
+        .node.active { opacity: 1; transform: scale(1); }
+        .node.tool_result { border-color: #00e5ff; box-shadow: 0 0 15px rgba(0,229,255,0.3); }
+        .node.critical { border-color: #ff3b6b; color: #ff3b6b; box-shadow: 0 0 20px rgba(255,59,107,0.5); background: rgba(255,59,107,0.1); }
+        .node.forked { border-color: #00ff94; color: #00ff94; box-shadow: 0 0 25px rgba(0,255,148,0.6); animation: pulse 1s infinite; }
+        .node.dimmed { opacity: 0.2; filter: blur(3px) grayscale(100%); border-color: #333; color: #555; }
+        @keyframes pulse { 0%,100% { box-shadow: 0 0 25px rgba(0,255,148,0.6); } 50% { box-shadow: 0 0 40px rgba(0,255,148,0.9); } }
+        .edge { position: absolute; width: 2px; height: 30px; background: rgba(0,229,255,0.4); left: 190px; opacity: 0; transition: opacity 0.5s; }
+        .edge.active { opacity: 1; }
+        .edit-panel { position: absolute; right: 0; top: 80px; width: 180px; background: rgba(18,20,30,0.95); border: 1px solid rgba(255,59,107,0.4); border-radius: 12px; padding: 16px; opacity: 0; transform: translateX(100px); transition: all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); }
+        .edit-panel.active { opacity: 1; transform: translateX(0); }
+        .edit-panel h4 { color: #ff3b6b; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+        .edit-panel pre { background: rgba(15,17,25,0.9); padding: 10px; border-radius: 6px; color: #00e5ff; font-size: 0.7rem; }
+        .edit-panel .arrow { color: #00ff94; text-align: center; padding: 8px 0; font-size: 1.2rem; }
+        .fork-split { position: absolute; top: 280px; left: 130px; font-size: 0.8rem; color: #00ff94; opacity: 0; transform: scale(0); transition: all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); }
+        .fork-split.active { opacity: 1; transform: scale(1); }
+        .result { position: absolute; bottom: 20px; left: 0; right: 0; text-align: center; opacity: 0; transition: all 0.6s; }
+        .result.active { opacity: 1; }
+        .result .forked-result { color: #ff3b6b; font-size: 1.1rem; font-weight: bold; }
+        .result .original-result { color: #555; font-size: 0.85rem; text-decoration: line-through; }
+        #restartBtn { position: absolute; bottom: 30px; right: 30px; background: rgba(0,229,255,0.2); border: 1px solid #00e5ff; color: #00e5ff; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 0.8rem; }
+        #restartBtn:hover { background: rgba(0,229,255,0.4); }
+        .edit-indicator { position: fixed; top: 60px; left: 30px; background: linear-gradient(135deg, #ff3b6b, #cc2d56); color: #fff; padding: 10px 20px; border-radius: 10px; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px; opacity: 0; transform: translateX(-100px); transition: all 0.5s; box-shadow: 0 0 30px rgba(255,59,107,0.5); }
+        .edit-indicator.active { opacity: 1; transform: translateX(0); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AgentTrace — Reality Fork Engine</h1>
+    </div>
+    <div class="edit-indicator" id="editIndicator">✏️ EDITING AI REALITY</div>
+
+    <div class="timeline">
+        <!-- Step indicator -->
+        <div class="step" id="step0">Step 0: User query</div>
+        <div class="step" id="step1">Step 1: AI reasoning</div>
+        <div class="step" id="step2">Step 2: Tool call</div>
+        <div class="step" id="step3">Step 3: Tool result (KEY)</div>
+
+        <!-- Nodes -->
+        <div class="node" id="node-start" style="left:140px; top:30px;">START</div>
+        <div class="edge" id="edge1" style="top:75px;"></div>
+        <div class="node" id="node-reason" style="left:140px; top:100px;">REASONING</div>
+        <div class="edge" id="edge2" style="top:145px;"></div>
+        <div class="node" id="node-tool" style="left:140px; top:170px;">TOOL_CALL</div>
+        <div class="edge" id="edge3" style="top:215px;"></div>
+        <div class="node" id="node-result" style="left:140px; top:250px;">TOOL_RESULT</div>
+
+        <!-- Fork animation -->
+        <div class="fork-split" id="forkSplit">↙ FORK ↘</div>
+        <div class="node" id="node-forked" style="left:50px; top:310px; opacity:0;">ORIGIN (dimmed)</div>
+        <div class="node" id="node-newpath" style="left:190px; top:310px; opacity:0;">NEW PATH (fork)</div>
+
+        <!-- Edit panel -->
+        <div class="edit-panel" id="editPanel">
+            <h4>Node Inspector</h4>
+            <pre id="editContent">{
+  "type": "tool_result",
+  "result": "CASE_NORMAL"
+}</pre>
+            <div class="arrow">↓ changed to ↓</div>
+            <pre style="color:#ff3b6b;">{
+  "type": "tool_result",
+  "result": "CASE_CRITICAL"
+}</pre>
+        </div>
+    </div>
+
+    <!-- Result -->
+    <div class="result" id="result">
+        <div class="original-result">Original: "Rest and fluids"</div>
+        <div class="forked-result">Forked: "CALL 911 EMERGENCY"</div>
+    </div>
+
+    <button id="restartBtn" onclick="restart()">↻ Replay</button>
+
+    <script>
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        async function play() {
+            // Step 0: Start appears
+            document.getElementById('step0').classList.add('active');
+            document.getElementById('node-start').classList.add('active');
+            await sleep(800);
+
+            // Step 1: Reasoning
+            document.getElementById('step1').classList.add('active');
+            document.getElementById('edge1').classList.add('active');
+            document.getElementById('node-reason').classList.add('active');
+            await sleep(700);
+
+            // Step 2: Tool call
+            document.getElementById('step2').classList.add('active');
+            document.getElementById('edge2').classList.add('active');
+            document.getElementById('node-tool').classList.add('active');
+            await sleep(700);
+
+            // Step 3: Tool result (KEY moment)
+            document.getElementById('step3').classList.add('active');
+            document.getElementById('edge3').classList.add('active');
+            document.getElementById('node-result').classList.add('active');
+            await sleep(1000);
+
+            // Edit panel slides in
+            document.getElementById('editIndicator').classList.add('active');
+            document.getElementById('editPanel').classList.add('active');
+            await sleep(1500);
+
+            // Fork animation
+            document.getElementById('editIndicator').classList.remove('active');
+            document.getElementById('node-result').classList.remove('tool_result');
+            document.getElementById('node-result').classList.add('critical');
+            document.getElementById('node-result').textContent = 'CASE_CRITICAL';
+
+            document.getElementById('forkSplit').classList.add('active');
+            await sleep(600);
+
+            // Dim original, show forked
+            document.getElementById('node-forked').style.opacity = '1';
+            document.getElementById('node-forked').classList.add('dimmed');
+            document.getElementById('node-newpath').style.opacity = '1';
+            document.getElementById('node-newpath').classList.add('forked');
+            document.getElementById('node-newpath').textContent = 'CASE_CRITICAL';
+
+            await sleep(500);
+
+            // Show result
+            document.getElementById('result').classList.add('active');
+            document.getElementById('editPanel').classList.remove('active');
+        }
+
+        function restart() {
+            document.querySelectorAll('.active').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.node').forEach(n => {
+                n.classList.remove('critical', 'forked', 'dimmed');
+                n.style.opacity = '';
+                n.textContent = n.id === 'node-result' ? 'TOOL_RESULT' : n.textContent;
+            });
+            setTimeout(play, 300);
+        }
+
+        play();
+    </script>
+</body>
+</html>
