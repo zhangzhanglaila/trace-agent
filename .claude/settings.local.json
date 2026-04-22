@@ -10,7 +10,8 @@
       "Bash(python -m uvicorn server.demo_server:app --port 8765 --host 0.0.0.0)",
       "Bash(curl:*)",
       "Bash(python -c ':*)",
-      "Bash(timeout 5 python -c ':*)"
+      "Bash(timeout 5 python -c ':*)",
+      "Bash(python agent_obs/execution_graph.py)"
     ]
   }
 }
