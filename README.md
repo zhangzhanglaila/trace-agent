@@ -1,138 +1,313 @@
-# AgentTrace — Reality Fork Engine
+# AgentTrace — Causal Semantic IR Engine
 
-> Edit any AI decision. Watch the future split.
+> "I changed one AI decision... and its future completely diverged"
 
-<!-- GIF placeholder: assets/demo.gif -->
+---
+
+## The Fork in Action
+
+```
+ORIGINAL TIMELINE                    FORKED TIMELINE (CASE_NORMAL → CASE_CRITICAL)
+
+n1: MOV R_query="Patient..."         n1: MOV R_query="Patient..."
+n2: CALL diagnose → R_result         n2: CALL diagnose → R_result
+n3: EQ @R_result=CASE_NORMAL         n3: EQ @R_result=CASE_CRITICAL  ← MODIFIED
+   ↓ (R_flag=False)                     ↓ (R_flag=True)
+n5a: R_out="REST AND FLUIDS"         n5b: R_out="CALL 911"  ← DIVERGENCE!
+n6: HALT                             n6: HALT
+```
+
+**Result:**
+- Original: "Rest and fluids"
+- Forked: "CALL 911"
+
+### Visual Timeline
+
+```
+                    ┌─────────────────┐
+                    │  n1: MOV query  │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  n2: CALL diag  │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  n3: EQ flag    │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │ (R_flag=False)    (R_flag=True) │
+              ↓                           ↓
+     ┌────────┴────────┐         ┌────────┴────────┐
+     │ n5a: REST AND   │         │ n5b: CALL 911   │  ← DIVERGENCE
+     │    FLUIDS       │         │    EMERGENCY    │
+     └────────┬────────┘         └────────┬────────┘
+              │                           │
+              └───────────┬───────────────┘
+                          ↓
+                    ┌────────┴────────┐
+                    │    n6: HALT     │
+                    └─────────────────┘
+```
+
+---
+
 <p align="center">
   <img src="assets/demo.gif" width="800"/>
 </p>
 
 ---
 
-## 🧠 What is this?
+## Causal Analysis (v1.1)
 
-AgentTrace is an **AI decision timeline editor**.
+AgentTrace provides true counterfactual causal analysis:
 
-It lets you:
+```bash
+python agenttrace.py causal examples/case_mild_discomfort.json
+```
 
-- Visualize an AI agent's thinking process as an interactive graph
-- Click ANY step in the reasoning chain
-- Modify a decision (e.g. NORMAL → CRITICAL)
-- Replay the agent and watch reality **fork into a new timeline**
+Output:
+```
+============================================================
+CAUSAL SEMANTIC ANALYSIS
+============================================================
+
+Query: Patient has mild discomfort
+
+[RESULT] REST AND FLUIDS
+
+--- CAUSAL PARENTS ---
+  R_flag = True
+    If flipped: REST AND FLUIDS → EMERGENCY PROTOCOL: CALL 911
+    [CRITICAL]
+
+--- COUNTERFACTUAL EXPLANATION ---
+Result: REST AND FLUIDS
+Causes:
+  - R_flag = True [CRITICAL]
+    If R_flag=False → EMERGENCY PROTOCOL: CALL 911
+
+--- CRITICAL PATH ---
+  n1 → n3 → n6
+
+Minimal causal chain (pruned):
+  n1: MOV ['R_query', 'Patient has mild discomfort']
+  n3: EQ ['@R_result', 'CASE_CRITICAL', 'R_flag']
+  n6: HALT []
+```
+
+**Key differences from v1.0:**
+- **Causal parents**: Uses fork-and-check to determine which variables are critical
+- **Counterfactual**: Shows what would happen if a variable had a different value
+- **Critical path**: Prunes non-essential nodes from the causal chain
 
 ---
 
-## 💥 The Core Idea
+## What is this?
 
-Today, AI agents are:
+AgentTrace is a **Causal Semantic IR Engine** for AI agents. It provides:
 
-> ❌ Black boxes  
-> ❌ Non-editable  
-> ❌ Single-path execution  
+- **Causal Explainability**: Understand why an AI made each decision
+- **Reality Forking**: Edit any decision point, replay the future
+- **Semantic Analysis**: Track value flow through the execution DAG
 
-AgentTrace turns them into:
-
-> ✅ Editable thought graphs  
-> ✅ Replayable decision timelines  
-> ✅ Branching multi-reality systems  
-
----
-
-## 🔥 The Viral Moment
-
-A simple edit changes everything:
+### The Viral Moment
 
 ```
 Original Timeline:                    Forked Timeline:
 Patient: mild discomfort              Patient: mild discomfort
    → CASE_NORMAL                         → CASE_CRITICAL
-   → "Take rest"                         → "CALL EMERGENCY SERVICES"
+   → "Rest and fluids"                    → "CALL 911"
 ```
 
-**One click.  
-Two realities.**
+**One edit. Two realities.**
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
-git clone https://github.com/yourname/AgentTrace
-cd AgentTrace
+# CLI usage
+python agenttrace.py explain examples/case_mild_discomfort.json
+python agenttrace.py fork examples/case_mild_discomfort.json
 
-pip install -r requirements.txt
+# Web demo
 python -m uvicorn server.demo_server:app --port 8765
-
-# Open:
-# http://localhost:8765
+# Open http://localhost:8765
 ```
 
 ---
 
-## 🧪 How it works
-
-### 1. Run Agent
-
-Click "Run Agent" → Watch step-by-step reasoning graph appear
-
-### 2. Inspect Thought
-
-Click any node → See AI internal state (thought, action, tool result)
-
-### 3. Fork Reality
-
-Edit a node:
+## Architecture
 
 ```
-CASE_NORMAL → CASE_CRITICAL
+User Query → ExecutionGraph → DAG → SemanticResolver → Causal Explanation
+                              ↓
+                         Fork Engine
+                              ↓
+                      Alternative Timeline
 ```
 
-Then click:
-
-**"MODIFY WORLD & RE-RUN"**
-
-Watch the timeline **split in real-time** — original path dims to gray, forked path glows neon green.
+**Core Components:**
+- **ExecutionGraph**: Program representation (IR + SSA + CFG)
+- **SemanticResolver**: Lattice-based value resolution
+- **DAGCache**: Canonical node interning for deduplication
+- **Fork Engine**: Snapshot → Modify → Replay → Branch
 
 ---
 
-## 🌌 Architecture
+## CLI Usage
 
+### Explain a Case
+
+```bash
+python agenttrace.py explain examples/case_mild_discomfort.json
 ```
-Agent Runtime:     step-based execution trace
-Frontend:          D3.js interactive graph
-Fork Engine:       snapshot → edit → replay → branch
-Core trick:        deterministic replay + step-level mutation
+
+Output:
+```
+============================================================
+AGENTTRACE CAUSAL EXPLANATION
+============================================================
+
+Query: Patient has mild discomfort
+
+Expected: NORMAL
+
+--- EXECUTION RESULT ---
+R_result = CALL(diagnose)
+R_flag   = False
+R_out    = REST AND FLUIDS
+
+--- SEMANTIC ANALYSIS ---
+R_out @ n6: phi = φ(n5a:REST AND FLUIDS, n5b:EMERGENCY PROTOCOL: CALL 911)
+  Definition site: n5a
+  Reasoning: ["Reaching definitions: ['n5a', 'n5b']", ...]
+
+--- CAUSAL NARRATIVE ---
+Path: n1 → n2 → n3 → n4 → n5b → n6
+  Because: n1 → n4: BRANCH on R_flag → ['n5b', 'n5a']
+```
+
+### Fork and Replay
+
+```bash
+python agenttrace.py fork examples/case_mild_discomfort.json
+```
+
+Output:
+```
+[ORIGINAL] R_out = REST AND FLUIDS
+[FORKED]  R_out = EMERGENCY PROTOCOL: CALL 911
+
+============================================================
+FORK DIVERGENCE:
+  Original: REST AND FLUIDS
+  Forked:   EMERGENCY PROTOCOL: CALL 911
+============================================================
+VERIFIED: Fork correctly changed outcome from REST to EMERGENCY
 ```
 
 ---
 
-## 🧠 Why this matters
+## Example Case Format
+
+```json
+{
+  "query": "Patient has mild discomfort",
+  "expected": {
+    "severity": "NORMAL",
+    "recommendation": "Rest and fluids"
+  },
+  "fork_at": "n3",
+  "patch": {
+    "op": "MOV",
+    "args": ["R_flag", "True"]
+  },
+  "expected_forked": {
+    "severity": "CRITICAL",
+    "recommendation": "CALL 911"
+  }
+}
+```
+
+---
+
+## Key Concepts
+
+### Semantic Lattice
+
+```
+Unknown
+   ↓
+Symbolic(@x)    ← register reference
+   ↓
+Constant(v)     ← concrete value
+   ↓
+Phi([incoming]) ← join point (implicit in SSA)
+   ↓
+Computed(op, args) ← operation result
+```
+
+### Causal Narrative
+
+Instead of just tracing execution, AgentTrace generates **Because/Therefore** narratives:
+
+```
+Because: n3 → EQ(@R_result, CASE_CRITICAL, R_flag)
+Therefore: n4 → BRANCH(R_flag, [n5b, n5a])
+```
+
+---
+
+## Why This Matters
 
 We are moving from:
 
-> "AI as a model"
+> "AI as a black box"
 
 to
 
-> "AI as a controllable simulation system"
+> "AI as an editable simulation system"
 
-AgentTrace is a first step toward:
-
-- ✅ editable agents
-- ✅ branching cognition
-- ✅ causal debugging of reasoning systems
-
----
-
-## 🛠 Tech Stack
-
-- **Backend**: FastAPI + WebSockets
-- **Frontend**: D3.js + B站-style UI (glow effects, blur, gradients)
-- **Agent**: MedicalTriageAgent with deterministic CASE flags
-- **Fork Engine**: EventEmitter snapshots → ReplayEngine fork
+AgentTrace enables:
+- Causal debugging of AI reasoning
+- Editable decision timelines
+- Branching multi-reality systems
 
 ---
 
-## 📜 License
+## Tech Stack
+
+- **ExecutionGraph**: Python IR with SSA + CFG
+- **SemanticResolver**: Lattice-based semantic analysis
+- **Server**: FastAPI + WebSockets
+- **Frontend**: D3.js interactive graph
+
+---
+
+## Files
+
+```
+agent_obs/
+├── execution_graph.py   # Core ExecutionGraph + SemanticResolver
+├── observe.py            # ReAct instrumentation
+├── emitter.py            # Event emitter with pause support
+└── replay.py            # Fork and replay engine
+
+server/
+└── demo_server.py       # FastAPI + WebSocket server
+
+examples/
+└── case_mild_discomfort.json  # Example case file
+
+agenttrace.py            # CLI entry point
+demo.html                # Web demo frontend
+```
+
+---
+
+## License
 
 MIT

@@ -1,0 +1,16 @@
+{
+  "query": "Patient has mild discomfort",
+  "expected": {
+    "severity": "NORMAL",
+    "recommendation": "Rest and fluids"
+  },
+  "fork_at": "n3",
+  "patch": {
+    "op": "MOV",
+    "args": ["R_flag", "True"]
+  },
+  "expected_forked": {
+    "severity": "CRITICAL",
+    "recommendation": "CALL 911"
+  }
+}

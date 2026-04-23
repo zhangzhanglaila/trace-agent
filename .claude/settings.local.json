@@ -11,7 +11,21 @@
       "Bash(curl:*)",
       "Bash(python -c ':*)",
       "Bash(timeout 5 python -c ':*)",
-      "Bash(python agent_obs/execution_graph.py)"
+      "Bash(python agent_obs/execution_graph.py)",
+      "Read(//d D:/**)",
+      "Bash(python -c \"import agent_obs.execution_graph\")",
+      "Bash(timeout 10 python -c \"from agent_obs.execution_graph import demo; demo\\(\\)\")",
+      "Bash(python -c \"print\\('test'\\)\")",
+      "Bash(python -c \"from agent_obs import execution_graph; execution_graph.demo\\(\\)\")",
+      "Bash(python agenttrace.py explain examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py fork examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py --help)",
+      "Bash(python agenttrace.py causal examples/case_mild_discomfort.json)",
+      "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); from agenttrace import *; import json; args = type\\('Args', \\(\\), {'case': 'examples/case_mild_discomfort.json'}\\)\\(\\); cmd_causal\\(args\\)\")",
+      "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); from agenttrace import *; import json; args = type\\('Args', \\(\\), {'case': 'examples/case_mild_discomfort.json'}\\)\\(\\); cmd_explain\\(args\\)\")",
+      "Bash(python agenttrace.py minimal examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py why-not --outcome \"CALL 911\" examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py classify examples/case_mild_discomfort.json)"
     ]
   }
 }

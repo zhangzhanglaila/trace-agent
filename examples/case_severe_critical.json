@@ -1,0 +1,16 @@
+{
+  "query": "Patient has severe chest pain and difficulty breathing",
+  "expected": {
+    "severity": "CRITICAL",
+    "recommendation": "CALL 911"
+  },
+  "fork_at": "n3",
+  "patch": {
+    "op": "MOV",
+    "args": ["R_flag", "False"]
+  },
+  "expected_forked": {
+    "severity": "NORMAL",
+    "recommendation": "Rest and fluids"
+  }
+}
