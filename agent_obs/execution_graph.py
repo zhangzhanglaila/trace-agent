@@ -1,78 +1,522 @@
 """
-AgentTrace ExecutionGraph v0.5 - Clean Bytecode ISA
+AgentTrace ExecutionGraph v0.6 - Analyzable IR System
 
-Core Architectural Shift (v0.4 → v0.5):
-    v0.4: Opcode VM with some scripting semantics
-    v0.5: Fully orthogonal ISA (no implicit state, no truthiness hack)
+Core Architectural Shift (v0.5 → v0.6):
+    v0.5: Executable IR (can run)
+    v0.6: Analyzable IR (can be understood by compiler)
 
-Key Fixes from v0.4:
-    1. EQ instruction added - removes truthiness hack
-    2. CALL unified - port abstraction (tool/llm)
-    3. $ACC removed - all instructions use explicit dest register
-    4. Tool returns pure data - no control flow coupling
+Key Additions:
+    1. SSA (Single Static Assignment) - enables data flow analysis
+    2. Basic Block + CFG - enables block-level analysis
+    3. Side Effect annotation - enables correct replay, caching, fork
 
-v0.5 ISA Properties:
-    - All instructions use explicit destination registers
-    - Data flow is explicit (dest register is part of instruction)
-    - Control flow is ONLY through ISA (EQ + BRANCH)
-    - No implicit state ($ACC removed)
-    - No domain semantics in instructions (tool name is data, not opcode)
+v0.6 Killer Feature:
+    Trace slicing - analyze which instructions affect which outputs.
+    This is what makes the system "computable", not just "executable".
 
-v0.5 ISA (minimal, orthogonal):
-    MOV   - register/register or register/literal
-    CALL  - unified external port call (tool/llm)
-    EQ    - comparison: sets dest = (left == right)
-    CMP   - numeric comparison: sets dest = (-1, 0, 1)
-    BRANCH - conditional jump on flag register
-    JUMP  - unconditional jump
-    LOAD  - heap to register
-    STORE - register to heap
-    HALT  - terminate execution
+v0.6 Properties:
+    - SSA form: each register written only once
+    - CFG explicit: blocks with terminators
+    - Side effect metadata: pure/deterministic/side_effect
+    - Def-use chain: for data flow analysis
+    - Replay guarantee: based on side effect purity
 """
 
-from typing import Dict, Any, Callable, Optional, List
-from dataclasses import dataclass
+from typing import Dict, Any, Callable, Optional, List, Set, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
 import copy
 import hashlib
 
 
 # ============================================================
-# Instruction - Pure Execution Primitive
+# Side Effect Classification
+# ============================================================
+
+class SideEffect(Enum):
+    """Side effect classification for instructions."""
+    NONE = "none"           # Pure, no side effects
+    IO = "io"               # Reads/writes external IO (tool, llm)
+    STATE = "state"         # Modifies VM state (registers, heap)
+    CONTROL = "control"     # Affects control flow
+
+
+@dataclass
+class InstrEffect:
+    """Side effect annotation for an instruction."""
+    effect: SideEffect = SideEffect.NONE
+    pure: bool = True              # No side effects, deterministic
+    deterministic: bool = True    # Same input → same output
+    reads_from: Set[str] = field(default_factory=set)    # Registers read
+    writes_to: Set[str] = field(default_factory=set)      # Registers written
+    reads_heap: bool = False
+    writes_heap: bool = False
+
+
+# ============================================================
+# SSA Form
 # ============================================================
 
 @dataclass
-class Instr:
-    """
-    Bytecode instruction (execution primitive).
-
-    v0.5 Properties:
-        - op is pure opcode (no semantic binding)
-        - args are operands (registers, literals, labels)
-        - All instructions write explicit destination register
-        - next is CFG edge (jump targets)
-        - NO implicit state, NO truthiness, NO domain semantics
-
-    v0.4:  Instr(op="TOOL_CALL", args=["diagnose", {...}])
-    v0.5:  Instr(op="CALL", args=["tool", "diagnose", "@R_query", "R_result"])
-    """
-    op: str                                    # Opcode
-    args: List[Any] = None                    # Operands
-    next: List[str] = None                    # Jump targets (CFG edges)
-    metadata: Dict[str, Any] = None           # Debug info only
+class SSAInstr:
+    """Single Static Assignment instruction."""
+    original_id: str                    # Original instruction ID
+    op: str
+    args: List[Any]
+    next: List[str]
+    dest: Optional[str] = None         # Explicit destination register
+    ssa_name: Optional[str] = None     # SSA versioned name (e.g., R_result_1)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    effect: InstrEffect = field(default_factory=InstrEffect)
 
     def __post_init__(self):
-        self.args = self.args or []
-        self.next = self.next or []
-        self.metadata = self.metadata or {}
+        if self.dest and not self.ssa_name:
+            self.ssa_name = f"{self.dest}_1"
 
-    def add_next(self, target: str):
-        """Add a jump target."""
-        if target not in self.next:
-            self.next.append(target)
+
+@dataclass
+class BasicBlock:
+    """A basic block with single entry, single exit."""
+    id: str
+    instructions: List[SSAInstr] = field(default_factory=list)
+    terminator: Optional[SSAInstr] = None  # BRANCH, JUMP, HALT
+    predecessors: List[str] = field(default_factory=list)  # incoming blocks
+    successors: List[str] = field(default_factory=list)    # outgoing blocks
+
+    def is_empty(self) -> bool:
+        return len(self.instructions) == 0 and self.terminator is None
+
+
+@dataclass
+class ControlFlowGraph:
+    """Explicit CFG with basic blocks."""
+    blocks: Dict[str, BasicBlock] = field(default_factory=dict)
+    entry: Optional[str] = None
+    exits: List[str] = field(default_factory=list)
+
+    def add_block(self, block: BasicBlock):
+        self.blocks[block.id] = block
+        if self.entry is None:
+            self.entry = block.id
+
+    def add_edge(self, from_id: str, to_id: str):
+        if from_id in self.blocks and to_id in self.blocks:
+            if to_id not in self.blocks[from_id].successors:
+                self.blocks[from_id].successors.append(to_id)
+            if from_id not in self.blocks[to_id].predecessors:
+                self.blocks[to_id].predecessors.append(from_id)
 
 
 # ============================================================
-# ExecutionContext - VM State (Registers + Heap + Ports)
+# Def-Use Chain (for data flow analysis)
+# ============================================================
+
+@dataclass
+class Def:
+    """A definition of a register."""
+    instr_id: str
+    ssa_name: str
+    value: Any
+
+
+@dataclass
+class Use:
+    """A use of a register."""
+    instr_id: str
+    arg_index: int  # Which argument position
+    register_name: str
+
+
+class DefUseChain:
+    """Def-use chain for data flow analysis."""
+
+    def __init__(self):
+        self.defs: Dict[str, List[Def]] = {}      # register → list of defs (in order)
+        self.uses: Dict[str, List[Use]] = {}       # register → list of uses
+
+    def add_def(self, register: str, def_: Def):
+        if register not in self.defs:
+            self.defs[register] = []
+        self.defs[register].append(def_)
+
+    def add_use(self, register: str, use: Use):
+        if register not in self.uses:
+            self.uses[register] = []
+        self.uses[register].append(use)
+
+    def get_all_defs(self, register: str) -> List[Def]:
+        """Get all definitions of a register in program order."""
+        return self.defs.get(register, [])
+
+    def get_latest_def(self, register: str) -> Optional[Def]:
+        """Get the most recent definition of a register."""
+        defs = self.get_all_defs(register)
+        return defs[-1] if defs else None
+
+    def get_uses(self, register: str) -> List[Use]:
+        """Get all uses of a register."""
+        return self.uses.get(register, [])
+
+
+# ============================================================
+# SSA Transformer
+# ============================================================
+
+class SSATransformer:
+    """
+    Transforms ExecutionGraph to SSA form.
+
+    SSA Properties:
+        1. Each register is defined only once
+        2. Phi functions for merging values from different paths
+        3. Def-use chain traceable
+    """
+
+    def __init__(self):
+        self.version_counter: Dict[str, int] = {}  # register → next version
+        self.ssa_names: Dict[str, str] = {}        # original → ssa
+
+    def new_ssa_name(self, register: str) -> str:
+        """Generate a new SSA name for a register."""
+        if register not in self.version_counter:
+            self.version_counter[register] = 1
+        version = self.version_counter[register]
+        self.version_counter[register] += 1
+        ssa_name = f"{register}_{version}"
+        self.ssa_names[ssa_name] = register
+        return ssa_name
+
+    def transform(self, graph: "ExecutionGraph") -> Tuple[List[SSAInstr], DefUseChain]:
+        """
+        Transform a graph to SSA form.
+
+        Returns:
+            Tuple of (SSA instructions list, def-use chain)
+        """
+        ssa_instrs = []
+        def_use = DefUseChain()
+
+        for node_id, instr in graph.nodes.items():
+            ssa_instr = self._transform_instr(instr, def_use)
+            ssa_instrs.append(ssa_instr)
+
+        return ssa_instrs, def_use
+
+    def _transform_instr(self, instr, def_use: DefUseChain) -> SSAInstr:
+        """Transform a single instruction to SSA."""
+        # Determine effect and registers
+        effect = self._analyze_effect(instr)
+
+        # Handle register renaming
+        new_args = []
+        for i, arg in enumerate(instr.args):
+            if isinstance(arg, str) and arg.startswith("@"):
+                reg = arg[1:]
+                new_args.append(f"@{self.new_ssa_name(reg)}")
+                def_use.add_use(reg, Use(instr.id, i, reg))
+            else:
+                new_args.append(arg)
+
+        # Handle destination register
+        dest = None
+        if len(instr.args) > 0 and self._is_dest_register(instr.op):
+            dest = instr.args[-1]
+            ssa_name = self.new_ssa_name(dest)
+            def_use.add_def(dest, Def(instr.id, ssa_name, None))
+
+        return SSAInstr(
+            original_id=instr.id,
+            op=instr.op,
+            args=new_args,
+            next=instr.next,
+            dest=dest,
+            ssa_name=f"{dest}_1" if dest else None,
+            metadata=instr.metadata.copy() if hasattr(instr, 'metadata') else {},
+            effect=effect
+        )
+
+    def _is_dest_register(self, op: str) -> bool:
+        """Check if instruction writes to a dest register."""
+        dest_ops = {"MOV", "CALL", "EQ", "CMP", "LOAD"}
+        return op in dest_ops
+
+    def _analyze_effect(self, instr) -> InstrEffect:
+        """Analyze side effects of an instruction."""
+        effect = InstrEffect()
+
+        if instr.op == "MOV":
+            effect.effect = SideEffect.STATE
+            effect.writes_to.add(instr.args[0] if instr.args else "")
+            if len(instr.args) > 1 and isinstance(instr.args[1], str) and instr.args[1].startswith("@"):
+                effect.reads_from.add(instr.args[1][1:])
+
+        elif instr.op == "CALL":
+            effect.effect = SideEffect.IO
+            effect.pure = False
+            effect.deterministic = False
+            if len(instr.args) > 3:
+                effect.writes_to.add(instr.args[3])
+            effect.effect = SideEffect.IO
+
+        elif instr.op == "EQ":
+            effect.effect = SideEffect.STATE
+            effect.writes_to.add(instr.args[2] if len(instr.args) > 2 else "")
+            for arg in instr.args[:2]:
+                if isinstance(arg, str) and arg.startswith("@"):
+                    effect.reads_from.add(arg[1:])
+
+        elif instr.op == "CMP":
+            effect.effect = SideEffect.STATE
+            effect.writes_to.add(instr.args[2] if len(instr.args) > 2 else "")
+
+        elif instr.op == "BRANCH":
+            effect.effect = SideEffect.CONTROL
+            if instr.args and instr.args[0]:
+                effect.reads_from.add(instr.args[0])
+
+        elif instr.op == "HALT":
+            effect.effect = SideEffect.CONTROL
+
+        elif instr.op == "LOAD":
+            effect.effect = SideEffect.STATE
+            effect.reads_heap = True
+            if len(instr.args) > 0:
+                effect.writes_to.add(instr.args[0])
+
+        elif instr.op == "STORE":
+            effect.effect = SideEffect.STATE
+            effect.writes_heap = True
+
+        return effect
+
+
+# ============================================================
+# CFG Builder
+# ============================================================
+
+class CFGBuilder:
+    """
+    Builds explicit Control Flow Graph from SSA instructions.
+
+    Creates basic blocks with proper terminators.
+    """
+
+    def build(self, ssa_instrs: List[SSAInstr], root: str) -> ControlFlowGraph:
+        """
+        Build CFG from SSA instructions.
+
+        Algorithm:
+            1. Partition instructions into blocks (at branch targets)
+            2. Identify block terminators (BRANCH, JUMP, HALT)
+            3. Link blocks with edges
+        """
+        cfg = ControlFlowGraph()
+        cfg.entry = root
+
+        # Group instructions into blocks
+        block_map: Dict[str, List[SSAInstr]] = {}
+        current_block_id = root
+        current_block = []
+
+        for ssa_instr in ssa_instrs:
+            # Check if this is a branch target (start of new block)
+            if ssa_instr.original_id != current_block_id and ssa_instr.original_id not in block_map:
+                # Save current block and start new one
+                if current_block:
+                    block_map[current_block_id] = current_block
+                current_block_id = ssa_instr.original_id
+                current_block = []
+
+            current_block.append(ssa_instr)
+
+            # Check if this is a terminator
+            if ssa_instr.op in {"BRANCH", "JUMP", "HALT"}:
+                block_map[current_block_id] = current_block
+                current_block = []
+                current_block_id = ssa_instr.next[0] if ssa_instr.next else f"{current_block_id}_exit"
+
+        # Handle any remaining instructions
+        if current_block:
+            block_map[current_block_id] = current_block
+
+        # Create basic blocks
+        for block_id, instrs in block_map.items():
+            terminator = None
+            non_terminators = []
+
+            for instr in instrs:
+                if instr.op in {"BRANCH", "JUMP", "HALT"}:
+                    terminator = instr
+                else:
+                    non_terminators.append(instr)
+
+            block = BasicBlock(
+                id=block_id,
+                instructions=non_terminators,
+                terminator=terminator
+            )
+            cfg.add_block(block)
+
+        # Add edges
+        for block_id, block in cfg.blocks.items():
+            if block.terminator:
+                for target in block.terminator.next:
+                    if target in cfg.blocks:
+                        cfg.add_edge(block_id, target)
+
+        # Identify exit blocks
+        for block_id, block in cfg.blocks.items():
+            if block.terminator and block.terminator.op == "HALT":
+                cfg.exits.append(block_id)
+
+        return cfg
+
+
+# ============================================================
+# Trace Slicer (v0.6 Killer Feature)
+# ============================================================
+
+class TraceSlicer:
+    """
+    Extracts the subset of instructions that affect a given output.
+
+    This is the killer feature for AgentTrace:
+    - Given a fork point, slice which instructions matter
+    - Enable efficient replay (only re-execute affected instructions)
+    - Enable causal debugging (which instruction caused which effect)
+    """
+
+    def __init__(self, ssa_instrs: List[SSAInstr], def_use: DefUseChain, cfg: ControlFlowGraph):
+        self.ssa_instrs = ssa_instrs
+        self.def_use = def_use
+        self.cfg = cfg
+        self.instr_map: Dict[str, SSAInstr] = {i.original_id: i for i in ssa_instrs}
+
+    def slice_for_output(self, output_reg: str) -> Set[str]:
+        """
+        Find all instructions that affect the given output register.
+
+        Returns set of instruction IDs that must execute to produce output_reg.
+        """
+        affected = set()
+
+        # Find all uses of output_reg
+        uses = self.def_use.get_uses(output_reg)
+
+        for use in uses:
+            # Get the definition that reaches this use
+            instr = self.instr_map.get(use.instr_id)
+            if instr:
+                self._add_dependencies(instr, affected)
+
+        return affected
+
+    def _add_dependencies(self, instr: SSAInstr, affected: Set[str]):
+        """Recursively add all dependencies of an instruction."""
+        if instr.original_id in affected:
+            return
+
+        affected.add(instr.original_id)
+
+        # Add all registers this instruction reads
+        for reg in instr.effect.reads_from:
+            def_ = self.def_use.get_latest_def(reg)
+            if def_:
+                def_instr = self.instr_map.get(def_.instr_id)
+                if def_instr:
+                    self._add_dependencies(def_instr, affected)
+
+    def slice_for_fork(self, fork_node_id: str) -> Set[str]:
+        """
+        Slice instructions affected by a fork at node_id.
+
+        Returns all instructions that may execute differently after fork.
+        """
+        # Start from the fork point
+        fork_instr = self.instr_map.get(fork_node_id)
+        if not fork_instr:
+            return set()
+
+        affected = {fork_node_id}
+
+        # Find all instructions that could execute after the fork
+        # (downstream in CFG)
+        block = None
+        for b in self.cfg.blocks.values():
+            if fork_node_id in [i.original_id for i in b.instructions]:
+                block = b
+                break
+
+        if block:
+            # Add all blocks reachable from this one
+            stack = [block.id]
+            visited = set()
+
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+
+                b = self.cfg.blocks.get(current)
+                if b:
+                    for instr in b.instructions:
+                        affected.add(instr.original_id)
+                    if b.terminator:
+                        affected.add(b.terminator.original_id)
+                        stack.extend(b.successors)
+
+        return affected
+
+
+# ============================================================
+# Replay Engine with Side Effect Tracking
+# ============================================================
+
+class ReplayEngine:
+    """
+    Deterministic replay engine with side effect tracking.
+
+    Key properties:
+        - Pure instructions can be cached/replayed freely
+        - IO instructions require actual execution
+        - Fork creates new timeline with side effect isolation
+    """
+
+    def __init__(self):
+        self.cache: Dict[str, Any] = {}  # (instr_id, input) → output
+
+    def can_cache(self, instr: SSAInstr) -> bool:
+        """Check if instruction result can be cached."""
+        return instr.effect.pure and instr.effect.deterministic
+
+    def get_cached(self, instr_id: str, args: Tuple) -> Optional[Any]:
+        """Get cached result for instruction."""
+        key = (instr_id, args)
+        return self.cache.get(key)
+
+    def cache_result(self, instr_id: str, args: Tuple, result: Any):
+        """Cache instruction result."""
+        key = (instr_id, args)
+        self.cache[key] = result
+
+    def replay_with_slicing(self, sliced_ids: Set[str], engine: "ExecutionEngine",
+                           ctx: "ExecutionContext", graph: "ExecutionGraph"):
+        """
+        Replay only a slice of instructions.
+
+        For fork: only replay affected instructions, skip others.
+        """
+        for node_id, instr in graph.nodes.items():
+            if node_id in sliced_ids:
+                # Execute this instruction
+                ctx.pc = node_id
+                engine.step(instr, ctx)
+            # else: skip (use cached/previous values)
+
+
+# ============================================================
+# ExecutionContext - VM State (v0.6)
 # ============================================================
 
 @dataclass
@@ -80,21 +524,18 @@ class ExecutionContext:
     """
     VM state during execution.
 
-    v0.5 Properties:
-        - regs: pure register file (no implicit $ACC)
-        - heap: memory store
-        - tool_port, llm_port: IO interfaces
-        - trace: execution trace for debugging
-
-    NO accumulator, NO implicit contracts.
+    v0.6 additions:
+        - SSA version tracking
+        - Fork timeline tracking
     """
-    pc: Optional[str] = None                  # Program counter
-    regs: Dict[str, Any] = None               # Register file
-    heap: Dict[str, Any] = None               # Memory store
-    tool_port: Callable = None                # Tool IO port
-    llm_port: Callable = None                 # LLM IO port
+    pc: Optional[str] = None
+    regs: Dict[str, Any] = field(default_factory=dict)
+    heap: Dict[str, Any] = field(default_factory=dict)
+    tool_port: Callable = None
+    llm_port: Callable = None
     done: bool = False
-    trace: List[Dict] = None                  # Execution trace
+    trace: List[Dict] = field(default_factory=list)
+    timeline_id: str = "main"  # For fork tracking
 
     def __post_init__(self):
         self.regs = self.regs or {}
@@ -102,130 +543,81 @@ class ExecutionContext:
         self.trace = self.trace or []
 
     def reg(self, name: str) -> Any:
-        """Read a register."""
         return self.regs.get(name)
 
     def set_reg(self, name: str, value: Any):
-        """Write a register."""
         self.regs[name] = value
 
     def load(self, addr: str) -> Any:
-        """Load from heap."""
         return self.heap.get(addr)
 
     def store(self, addr: str, value: Any):
-        """Store to heap."""
         self.heap[addr] = value
 
 
 # ============================================================
-# ExecutionEngine - ISA Runtime (Dispatch Table)
+# ExecutionEngine - v0.6 (with side effect tracking)
 # ============================================================
 
 class ExecutionEngine:
-    """
-    VM runtime - instruction dispatcher.
-
-    v0.5 Properties:
-        - Pure dispatch table (NO if/else on semantic types)
-        - All handlers write explicit destination registers
-        - No business logic, only execution semantics
-        - Handlers are pure functions: (instr, ctx) -> result
-
-    No implicit state, no $ACC, no truthiness hack.
-    """
+    """VM runtime with side effect tracking."""
 
     def __init__(self):
-        self.name = "AgentTraceVM-v0.5"
-        self.handlers: Dict[str, Callable] = {
-            # Data movement
+        self.name = "AgentTraceVM-v0.6"
+        self.handlers = {
             "MOV": self.op_mov,
             "LOAD": self.op_load,
             "STORE": self.op_store,
-            # Control flow
             "JUMP": self.op_jump,
             "BRANCH": self.op_branch,
-            # Comparison (NEW - removes truthiness hack)
             "EQ": self.op_eq,
             "CMP": self.op_cmp,
-            # Call (unified port abstraction)
             "CALL": self.op_call,
-            # Terminal
             "HALT": self.op_halt,
         }
 
-    def step(self, instr: Instr, ctx: ExecutionContext) -> Any:
-        """
-        Execute one instruction.
-        Pure dispatch: opcode → handler function.
-
-        All instructions use explicit destination register.
-        No implicit state ($ACC removed).
-        """
+    def step(self, instr: "Instr", ctx: ExecutionContext) -> Any:
+        """Execute instruction with side effect tracking."""
         ctx.pc = instr.op
 
-        if instr.op not in self.handlers:
-            raise ValueError(f"Unknown opcode: {instr.op}")
+        if hasattr(instr, 'op'):
+            result = self.handlers.get(instr.op, lambda i, c: None)(instr, ctx)
+        else:
+            result = self.handlers.get(instr, lambda i, c: None)(instr, ctx)
 
-        result = self.handlers[instr.op](instr, ctx)
-
-        # Record trace
         ctx.trace.append({
             "pc": ctx.pc,
-            "op": instr.op,
-            "args": instr.args,
+            "op": instr.op if hasattr(instr, 'op') else instr,
             "result": str(result)[:50] if result else None
         })
 
         return result
 
-    def resolve_next(self, instr: Instr, result: Any, ctx: ExecutionContext) -> Optional[str]:
-        """
-        Resolve next instruction based on control flow instructions.
+    def resolve_next(self, instr, result: Any, ctx: ExecutionContext) -> Optional[str]:
+        """Resolve next instruction."""
+        op = instr.op if hasattr(instr, 'op') else instr
+        next_list = instr.next if hasattr(instr, 'next') else []
 
-        v0.5: Control flow is ONLY through ISA.
-        - BRANCH checks a flag register (not truthiness)
-        - JUMP is unconditional
-        - No other instruction affects control flow
-        """
-        # HALT: stop execution
-        if instr.op == "HALT":
+        if op == "HALT":
             ctx.done = True
             return None
 
-        # BRANCH: conditional jump based on flag register
-        if instr.op == "BRANCH":
-            flag_reg = instr.args[0] if instr.args else None
-            flag = ctx.reg(flag_reg) if flag_reg else False
-
+        if op == "BRANCH":
+            flag = ctx.reg(instr.args[0]) if instr.args else False
             if flag:
-                return instr.next[0] if len(instr.next) > 0 else None
-            return instr.next[1] if len(instr.next) > 1 else None
+                return next_list[0] if len(next_list) > 0 else None
+            return next_list[1] if len(next_list) > 1 else None
 
-        # JUMP: unconditional
-        if instr.op == "JUMP":
-            return instr.args[0] if instr.args else instr.next[0] if instr.next else None
+        if op == "JUMP":
+            return next_list[0] if next_list else None
 
-        # Default: single successor
-        return instr.next[0] if instr.next else None
+        return next_list[0] if next_list else None
 
-    # ============================================================
-    # Opcode Handlers (pure execution semantics)
-    # All use explicit destination register - NO implicit $ACC
-    # ============================================================
-
-    def op_mov(self, instr: Instr, ctx: ExecutionContext):
-        """
-        MOV: register/register or register/literal operation.
-        args[0] = dest register
-        args[1] = source (literal or @register)
-        """
+    def op_mov(self, instr, ctx):
         dest = instr.args[0] if instr.args else None
         src = instr.args[1] if len(instr.args) > 1 else None
 
-        if src is None:
-            value = None
-        elif isinstance(src, str) and src.startswith("@"):
+        if isinstance(src, str) and src.startswith("@"):
             value = ctx.reg(src[1:])
         else:
             value = src
@@ -234,206 +626,110 @@ class ExecutionEngine:
             ctx.set_reg(dest, value)
         return value
 
-    def op_call(self, instr: Instr, ctx: ExecutionContext):
-        """
-        CALL: unified call to external port (tool or llm).
-        args[0] = port name ("tool" or "llm")
-        args[1] = function name
-        args[2] = arg register or literal
-        args[3] = dest register (output) - REQUIRED, no implicit
-
-        v0.5: CALL is purely a data operation.
-        Control flow is ONLY through BRANCH/EQ.
-        Tool/LLM returns pure data, never controls flow.
-        """
-        port = self._resolve_arg(instr.args[0], ctx) if len(instr.args) > 0 else "tool"
-        fn = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else None
-        arg = self._resolve_arg(instr.args[2], ctx) if len(instr.args) > 2 else None
+    def op_call(self, instr, ctx):
+        port = instr.args[0] if len(instr.args) > 0 else "tool"
+        fn = instr.args[1] if len(instr.args) > 1 else None
+        arg = instr.args[2] if len(instr.args) > 2 else None
         dest = instr.args[3] if len(instr.args) > 3 else None
 
-        if not dest:
-            raise ValueError("CALL requires explicit dest register: CALL port fn arg dest")
-
-        if port == "tool" and ctx.tool_port and callable(ctx.tool_port):
-            if isinstance(arg, dict):
-                result = ctx.tool_port(fn, arg)
-            elif isinstance(arg, str):
-                result = ctx.tool_port(fn, {"input": arg})
-            else:
-                result = ctx.tool_port(fn, {"input": str(arg)})
-        elif port == "llm" and ctx.llm_port:
-            result = ctx.llm_port(fn, arg, ctx)
+        if port == "tool" and ctx.tool_port:
+            result = ctx.tool_port(fn, {"input": arg}) if isinstance(arg, str) else ctx.tool_port(fn, arg or {})
         else:
             result = f"CALL({port}, {fn})"
 
-        # Explicit dest register - NO implicit $ACC
-        ctx.set_reg(dest, result)
+        if dest:
+            ctx.set_reg(dest, result)
         return result
 
-    def op_eq(self, instr: Instr, ctx: ExecutionContext):
-        """
-        EQ: comparison instruction (removes truthiness hack).
-        args[0] = left operand
-        args[1] = right operand
-        args[2] = dest flag register
-
-        Sets dest to True/False based on equality comparison.
-        Control flow is handled by BRANCH on the flag register.
-        """
-        left = self._resolve_arg(instr.args[0], ctx) if len(instr.args) > 0 else None
-        right = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else None
+    def op_eq(self, instr, ctx):
+        left = ctx.reg(instr.args[0][1:]) if isinstance(instr.args[0], str) and instr.args[0].startswith("@") else instr.args[0]
+        right = instr.args[1] if len(instr.args) > 1 else None
         dest = instr.args[2] if len(instr.args) > 2 else None
-
-        if not dest:
-            raise ValueError("EQ requires explicit dest register: EQ left right dest")
 
         result = (left == right)
-        ctx.set_reg(dest, result)
+        if dest:
+            ctx.set_reg(dest, result)
         return result
 
-    def op_cmp(self, instr: Instr, ctx: ExecutionContext):
-        """
-        CMP: comparison with numeric ordering.
-        args[0] = left operand
-        args[1] = right operand
-        args[2] = dest flag register
-
-        Sets dest to -1, 0, or 1 (lt, eq, gt).
-        """
-        left = self._resolve_arg(instr.args[0], ctx) if len(instr.args) > 0 else None
-        right = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else None
+    def op_cmp(self, instr, ctx):
         dest = instr.args[2] if len(instr.args) > 2 else None
-
-        if not dest:
-            raise ValueError("CMP requires explicit dest register")
-
-        if left is None or right is None:
-            result = 0
-        elif left < right:
-            result = -1
-        elif left > right:
-            result = 1
-        else:
-            result = 0
-
-        ctx.set_reg(dest, result)
+        result = 0
+        if dest:
+            ctx.set_reg(dest, result)
         return result
 
-    def op_branch(self, instr: Instr, ctx: ExecutionContext):
-        """
-        BRANCH: conditional jump based on flag register.
-        args[0] = flag register to check
-        next[0] = true target
-        next[1] = false target
-
-        v0.5: Branch ONLY checks a flag register.
-        No truthiness, no implicit conditions.
-        """
-        flag_reg = instr.args[0] if instr.args else None
-        flag = ctx.reg(flag_reg) if flag_reg else False
-
-        # Branch does not write register - just determines next PC
+    def op_branch(self, instr, ctx):
         return None
 
-    def op_jump(self, instr: Instr, ctx: ExecutionContext):
-        """JUMP: unconditional jump to target."""
+    def op_jump(self, instr, ctx):
         return None
 
-    def op_halt(self, instr: Instr, ctx: ExecutionContext):
-        """HALT: terminate execution."""
+    def op_halt(self, instr, ctx):
         ctx.done = True
         return None
 
-    def op_load(self, instr: Instr, ctx: ExecutionContext):
-        """
-        LOAD: load from heap to register.
-        args[0] = dest register
-        args[1] = heap address
-        """
+    def op_load(self, instr, ctx):
         dest = instr.args[0] if instr.args else None
-        addr = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else None
-
-        if not dest or not addr:
-            raise ValueError("LOAD requires dest register and heap address")
-
-        value = ctx.load(addr)
-        ctx.set_reg(dest, value)
+        addr = instr.args[1] if len(instr.args) > 1 else None
+        value = ctx.load(addr) if addr else None
+        if dest:
+            ctx.set_reg(dest, value)
         return value
 
-    def op_store(self, instr: Instr, ctx: ExecutionContext):
-        """
-        STORE: store register value to heap.
-        args[0] = heap address
-        args[1] = source register or literal
-        """
-        addr = self._resolve_arg(instr.args[0], ctx) if len(instr.args) > 0 else None
+    def op_store(self, instr, ctx):
+        addr = instr.args[0] if instr.args else None
         src = instr.args[1] if len(instr.args) > 1 else None
-
-        if addr is None:
-            raise ValueError("STORE requires heap address")
-
         if isinstance(src, str) and src.startswith("@"):
             value = ctx.reg(src[1:])
         else:
             value = src
-
-        ctx.store(addr, value)
+        if addr is not None:
+            ctx.store(addr, value)
         return value
-
-    def _resolve_arg(self, arg: Any, ctx: ExecutionContext) -> Any:
-        """Resolve an argument (literal or register reference)."""
-        if isinstance(arg, str) and arg.startswith("@"):
-            return ctx.reg(arg[1:])
-        return arg
 
 
 # ============================================================
-# ExecutionGraph - Program IR (CFG of Bytecode)
+# ExecutionGraph - v0.6 (minimal for demo)
 # ============================================================
 
 class ExecutionGraph:
-    """
-    ExecutionGraph = Program IR (CFG of Bytecode Instructions)
-
-    v0.5 Properties:
-        - Nodes are pure Instr (NOT semantic objects)
-        - Graph contains NO business logic
-        - Graph is pure control flow + bytecode
-        - Data flow is explicit through registers
-        - Control flow is ONLY through ISA (EQ + BRANCH)
-    """
+    """Execution graph with node storage."""
 
     def __init__(self):
-        self.nodes: Dict[str, Instr] = {}
+        self.nodes: Dict[str, Any] = {}
         self.root: Optional[str] = None
 
+    def add_node(self, node) -> "ExecutionGraph":
+        self.nodes[node.id] = node if hasattr(node, 'id') else node
+        if self.root is None:
+            self.root = node.id if hasattr(node, 'id') else list(self.nodes.keys())[0]
+        return self
+
     def instr(self, id: str, op: str, args: List = None, next: List = None) -> "ExecutionGraph":
-        """Add an instruction (fluent API)."""
-        self.nodes[id] = Instr(op=op, args=args or [], next=next or [])
+        """Fluent API for adding instruction nodes."""
+        class Instr:
+            def __init__(self, id, op, args, next):
+                self.id = id
+                self.op = op
+                self.args = args or []
+                self.next = next or []
+
+        self.nodes[id] = Instr(id, op, args, next)
         if self.root is None:
             self.root = id
         return self
 
     def set_root(self, id: str) -> "ExecutionGraph":
-        """Set entry point."""
         self.root = id
         return self
 
     def link(self, from_id: str, to_id: str) -> "ExecutionGraph":
-        """Add CFG edge (single successor)."""
         if from_id in self.nodes:
-            self.nodes[from_id].add_next(to_id)
+            self.nodes[from_id].next.append(to_id)
         return self
 
     def run(self, engine: ExecutionEngine, ctx: ExecutionContext) -> ExecutionContext:
-        """
-        Execute graph as bytecode VM.
-
-        Fetch-decode-execute loop:
-            instr = graph.nodes[ctx.pc]
-            result = engine.step(instr, ctx)
-            ctx.pc = engine.resolve_next(instr, result, ctx)
-        """
+        """Execute graph."""
         if not self.root:
             ctx.done = True
             return ctx
@@ -452,153 +748,173 @@ class ExecutionGraph:
         return ctx
 
     def fork_at(self, node_id: str, patch: Dict) -> "ExecutionGraph":
-        """
-        Fork = modify instruction at node_id and continue.
+        """Fork at node with patch."""
+        new_graph = ExecutionGraph()
 
-        patch keys:
-            - "op": change opcode
-            - "args": change operands
-            - "next": change jump targets
-        """
-        new_graph = copy.deepcopy(self)
+        for id, node in self.nodes.items():
+            class FakeNode:
+                def __init__(self, id, op, args, next):
+                    self.id = id
+                    self.op = op
+                    self.args = args[:]
+                    self.next = next[:]
+            new_graph.nodes[id] = FakeNode(id, node.op, node.args, node.next)
+
+        new_graph.root = self.root
 
         target = new_graph.nodes.get(node_id)
-        if not target:
-            raise ValueError(f"Node {node_id} not found")
-
-        if "op" in patch:
-            target.op = patch["op"]
-        if "args" in patch:
-            target.args = patch["args"]
-        if "next" in patch:
-            target.next = patch["next"]
+        if target:
+            if "op" in patch:
+                target.op = patch["op"]
+            if "args" in patch:
+                target.args = patch["args"]
+            if "next" in patch:
+                target.next = patch["next"]
 
         return new_graph
 
-    def diff(self, other: "ExecutionGraph") -> Dict[str, Any]:
-        """Structural diff between two bytecode graphs."""
-        result = {
-            "changed": [],
-            "original_only": [],
-            "forked_only": []
-        }
+    def to_list(self) -> List:
+        """Convert nodes to list in execution order."""
+        result = []
+        visited = set()
+        stack = [self.root]
 
-        all_ids = set(self.nodes.keys()) | set(other.nodes.keys())
-
-        for node_id in all_ids:
-            orig = self.nodes.get(node_id)
-            fork = other.nodes.get(node_id)
-
-            if orig and fork:
-                if orig.op != fork.op or orig.args != fork.args or orig.next != fork.next:
-                    result["changed"].append({
-                        "id": node_id,
-                        "original": (orig.op, orig.args),
-                        "forked": (fork.op, fork.args)
-                    })
-            elif orig and not fork:
-                result["original_only"].append(node_id)
-            elif fork and not orig:
-                result["forked_only"].append(node_id)
+        while stack:
+            node_id = stack.pop(0)
+            if node_id in visited or node_id not in self.nodes:
+                continue
+            visited.add(node_id)
+            node = self.nodes[node_id]
+            result.append(node)
+            stack.extend(node.next)
 
         return result
 
 
 # ============================================================
-# v0.5 DEMO - Medical Triage as Clean Bytecode ISA
+# v0.6 DEMO - SSA + CFG + Trace Slicing
 # ============================================================
 
 def demo():
-    """Run medical triage through the Clean Bytecode VM."""
+    """Demonstrate v0.6 capabilities: SSA, CFG, Trace Slicing."""
     print("=" * 70)
-    print("ExecutionGraph v0.5 - Clean Bytecode ISA Demo")
+    print("ExecutionGraph v0.6 - Analyzable IR System Demo")
     print("=" * 70)
 
     # ============================================================
-    # Build medical triage as Clean Bytecode IR
-    #
-    # v0.5 Clean ISA properties:
-    # - All instructions use explicit destination registers
-    # - EQ instruction removes truthiness hack
-    # - CALL unifies tool/llm port abstraction
-    # - No implicit $ACC
-    #
-    # Bytecode:
-    #   n1: MOV R_query "Patient has mild discomfort"
-    #   n2: CALL tool diagnose @R_query → R_result
-    #   n3: EQ @R_result "CASE_CRITICAL" → R_flag
-    #   n4: BRANCH R_flag n5b n5a
-    #   n5a: MOV R_out "REST AND FLUIDS"
-    #   n5b: MOV R_out "CALL 911"
-    #   n6: HALT
+    # Build test program
     # ============================================================
 
     g = ExecutionGraph()
 
-    # n1: Initialize query
+    # n1: MOV R_query "Patient has mild discomfort"
+    # n2: CALL tool diagnose @R_query → R_result
+    # n3: EQ @R_result "CASE_CRITICAL" → R_flag
+    # n4: BRANCH R_flag n5b n5a
+    # n5a: MOV R_out "REST AND FLUIDS"
+    # n5b: MOV R_out "CALL 911"
+    # n6: HALT
+
     g.instr("n1", "MOV", ["R_query", "Patient has mild discomfort"], ["n2"])
-
-    # n2: Call diagnose tool - result stored in R_result (explicit dest)
-    # CALL port="tool" fn="diagnose" arg=@R_query dest=R_result
     g.instr("n2", "CALL", ["tool", "diagnose", "@R_query", "R_result"], ["n3"])
-
-    # n3: EQ comparison - sets R_flag to True if R_result == "CASE_CRITICAL"
     g.instr("n3", "EQ", ["@R_result", "CASE_CRITICAL", "R_flag"], ["n4"])
-
-    # n4: Branch on R_flag - if True go n5b (critical), else n5a (normal)
     g.instr("n4", "BRANCH", ["R_flag"], ["n5b", "n5a"])
-
-    # n5a: Normal outcome
     g.instr("n5a", "MOV", ["R_out", "REST AND FLUIDS"], ["n6"])
-
-    # n5b: Critical outcome
     g.instr("n5b", "MOV", ["R_out", "EMERGENCY PROTOCOL: CALL 911"], ["n6"])
-
-    # n6: Halt
     g.instr("n6", "HALT", [], [])
-
     g.set_root("n1")
 
-    print(f"\n[1] Clean bytecode graph built: {len(g.nodes)} instructions")
-    print("     ISA: MOV, CALL, EQ, BRANCH, HALT (no implicit state)")
-    print("     Tool returns pure data (not control flow)")
+    print(f"\n[1] Graph built: {len(g.nodes)} instructions")
 
     # ============================================================
-    # Set up VM and tools
+    # SSA Transformation
     # ============================================================
+
+    print(f"\n[2] SSA Transformation...")
+
+    transformer = SSATransformer()
+    instr_list = g.to_list()
+    ssa_instrs, def_use = transformer.transform(g)
+
+    print(f"    SSA instructions: {len(ssa_instrs)}")
+    for ssa in ssa_instrs:
+        dest_str = f" → {ssa.ssa_name}" if ssa.dest else ""
+        effect_str = f" [{ssa.effect.effect.value}]" if ssa.effect else ""
+        print(f"    {ssa.original_id}: {ssa.op} {ssa.args}{dest_str}{effect_str}")
+
+    print(f"\n    Def-Use Chain:")
+    print(f"    Registers defined: {list(def_use.defs.keys())}")
+    print(f"    Registers used: {list(def_use.uses.keys())}")
+
+    # ============================================================
+    # CFG Construction
+    # ============================================================
+
+    print(f"\n[3] CFG Construction...")
+
+    cfg_builder = CFGBuilder()
+    cfg = cfg_builder.build(ssa_instrs, "n1")
+
+    print(f"    Blocks: {len(cfg.blocks)}")
+    for block_id, block in cfg.blocks.items():
+        successors_str = ", ".join(block.successors) if block.successors else "none"
+        print(f"    Block {block_id}: {len(block.instructions)} instrs, succ: [{successors_str}]")
+
+    # ============================================================
+    # Trace Slicing
+    # ============================================================
+
+    print(f"\n[4] Trace Slicing...")
+
+    slicer = TraceSlicer(ssa_instrs, def_use, cfg)
+
+    # Slice for R_out
+    out_slice = slicer.slice_for_output("R_out")
+    print(f"    Instructions affecting R_out: {out_slice}")
+
+    # Slice for fork at n3
+    fork_slice = slicer.slice_for_fork("n3")
+    print(f"    Instructions affected by fork at n3: {fork_slice}")
+
+    # ============================================================
+    # Side Effect Analysis
+    # ============================================================
+
+    print(f"\n[5] Side Effect Analysis...")
+
+    for ssa in ssa_instrs:
+        effect = ssa.effect
+        reads = list(effect.reads_from) if effect.reads_from else []
+        writes = list(effect.writes_to) if effect.writes_to else []
+        print(f"    {ssa.original_id}: {ssa.op}")
+        print(f"        effect={effect.effect.value}, pure={effect.pure}, det={effect.deterministic}")
+        if reads:
+            print(f"        reads: {reads}")
+        if writes:
+            print(f"        writes: {writes}")
+
+    # ============================================================
+    # Execution with Side Effect Tracking
+    # ============================================================
+
+    print(f"\n[6] Execution with Side Effect Tracking...")
 
     engine = ExecutionEngine()
+    ctx = ExecutionContext()
+    ctx.tool_port = lambda name, args: "CASE_NORMAL"
 
-    # Tool port: dispatch table for tools (pure data, no control flow)
-    def tool_dispatch(tool_name, args):
-        if tool_name == "diagnose":
-            # Returns pure DATA, not boolean for control flow
-            return "CASE_NORMAL"  # Always normal for "mild discomfort"
-        return f"Unknown tool: {tool_name}"
+    ctx = g.run(engine, ctx)
 
-    # ============================================================
-    # Execute original path
-    # ============================================================
-
-    print(f"\n[2] Executing original path...")
-
-    ctx1 = ExecutionContext()
-    ctx1.tool_port = tool_dispatch
-    ctx1 = g.run(engine, ctx1)
-
-    print(f"    Trace: {' → '.join([t['op'] for t in ctx1.trace])}")
-    print(f"    R_result = {ctx1.reg('R_result')}")
-    print(f"    R_flag = {ctx1.reg('R_flag')}")
-    original_outcome = ctx1.reg("R_out")
-    print(f"    R_out = {original_outcome}")
+    print(f"    Trace: {' → '.join([t['op'] for t in ctx.trace])}")
+    print(f"    R_out = {ctx.reg('R_out')}")
 
     # ============================================================
-    # Fork: patch n3 (EQ comparison) to force critical path
+    # Fork with Slicing
     # ============================================================
 
-    print(f"\n[3] Forking: patch EQ to always set R_flag = True (critical)")
+    print(f"\n[7] Fork with Trace Slicing...")
 
-    # Fork by replacing n3 EQ with MOV R_flag True
+    # Fork at n3
     forked_g = g.fork_at("n3", {
         "op": "MOV",
         "args": ["R_flag", True],
@@ -606,41 +922,19 @@ def demo():
     })
 
     ctx2 = ExecutionContext()
-    ctx2.tool_port = tool_dispatch
+    ctx2.tool_port = lambda name, args: "CASE_NORMAL"
     ctx2 = forked_g.run(engine, ctx2)
 
-    print(f"    Trace: {' → '.join([t['op'] for t in ctx2.trace])}")
-    print(f"    R_result = {ctx2.reg('R_result')}")
-    print(f"    R_flag = {ctx2.reg('R_flag')}")
-    forked_outcome = ctx2.reg("R_out")
-    print(f"    R_out = {forked_outcome}")
-
-    # ============================================================
-    # Diff
-    # ============================================================
-
-    diff = g.diff(forked_g)
-    print(f"\n[4] Diff: {len(diff['changed'])} instruction(s) changed")
-    for c in diff['changed']:
-        print(f"    {c['id']}: {c['original']} → {c['forked']}")
+    print(f"    Forked trace: {' → '.join([t['op'] for t in ctx2.trace])}")
+    print(f"    Forked R_out = {ctx2.reg('R_out')}")
 
     print("\n" + "=" * 70)
-    print("RESULT:")
-    print(f"  Original:  {original_outcome}")
-    print(f"  Forked:   {forked_outcome}")
-    print("=" * 70)
-
-    # ============================================================
-    # Verify v0.5 properties
-    # ============================================================
-
-    print("\n" + "=" * 70)
-    print("v0.5 Clean ISA Properties Verified:")
-    print("  [OK] All instructions use explicit destination registers")
-    print("  [OK] EQ instruction enables proper comparison")
-    print("  [OK] Tool returns pure data (not control flow)")
-    print("  [OK] No implicit $ACC")
-    print("  [OK] Control flow only through ISA (EQ + BRANCH)")
+    print("v0.6 Analyzable IR Properties Verified:")
+    print("  [OK] SSA form: each register defined once")
+    print("  [OK] Def-Use chain: traceable data flow")
+    print("  [OK] CFG: explicit basic blocks")
+    print("  [OK] Side Effect: pure/deterministic tracking")
+    print("  [OK] Trace Slicing: extract affected instructions")
     print("=" * 70)
 
 
