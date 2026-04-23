@@ -1,405 +1,431 @@
 """
-AgentTrace ExecutionGraph v0.3 - Graph VM Kernel
+AgentTrace ExecutionGraph v0.4 - Bytecode Execution Layer
 
-Core Architectural Shift (v0.2 → v0.3):
-    v0.2: graph executes agent
-    v0.3: agent interprets graph as IR (VM semantics)
-
-    NOT a linked-list executor.
-    Graph is a CFG (Control Flow Graph), engine is the VM.
+Core Architectural Shift (v0.3 → v0.4):
+    v0.3: Structural VM (type + spec, if/else dispatch)
+    v0.4: Instruction VM (opcode + args, dispatch table)
 
 Key Principles:
-    1. Node = declarative IR instruction (no compute_fn)
-    2. ExecutionEngine = semantic runtime (step function)
-    3. Control flow = engine + graph joint resolution (NOT node.next)
+    1. Node = execution primitive (NOT semantic object)
+       Before: Node(type="LLM", spec={"tool": "diagnose"})
+       After:  Instr(op="TOOL_CALL", args=["diagnose", ...])
+    2. Engine = opcode dispatcher (NOT business logic)
+       Before: if node.type == "LLM": ...
+       After:  handlers[instr.op](instr, ctx)
+    3. Graph = pure CFG bytecode (NO semantics in graph)
+       Only: opcode + edges
 
-v0.3 Architecture:
-    ┌──────────────┐
-    │ ExecutionVM  │  ← engine.step(node, ctx)
-    └──────┬───────┘
-           │
-    semantic execution
-           │
-           ▼
-    ┌──────────────┐
-    │   Node IR    │  ← spec is declarative
-    └──────┬───────┘
-           │
-    transition resolution
-           │
-           ▼
-    ┌──────────────┐
-    │ Next Node(s) │  ← resolve_next(node, result, graph)
-    └──────────────┘
+v0.4 Architecture:
+    ┌─────────────────────────────────────────────────────────────┐
+    │  Instr (execution primitive)                                │
+    │  - op: opcode string                                        │
+    │  - args: operands (registers, literals, labels)              │
+    │  - next: possible jump targets                              │
+    └─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  ExecutionEngine (ISA runtime)                              │
+    │  - handlers: dispatch table (op → handler function)          │
+    │  - step(): fetch-decode-execute loop                        │
+    │  - NO business logic, only instruction execution             │
+    └─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  ExecutionContext (VM state)                                 │
+    │  - pc: program counter (current node ID)                     │
+    │  - regs: register file (named values)                        │
+    │  - heap: memory store                                        │
+    │  - ports: IO interfaces (tool, llm)                          │
+    └─────────────────────────────────────────────────────────────┘
+
+Opcode Set (ISA):
+    LLM_CALL    - invoke LLM with prompt from args[0]
+    TOOL_CALL   - invoke tool args[0] with args[1]
+    BRANCH      - conditional jump based on regs[args[0]]
+    JUMP        - unconditional jump to args[0]
+    MOV         - register operation: regs[dest] = regs[src] or literal
+    HALT        - terminate execution
 """
 
-from typing import Dict, Any, Callable, Optional, List, Union
+from typing import Dict, Any, Callable, Optional, List
+from dataclasses import dataclass
 import copy
 import hashlib
-import json
 
 
 # ============================================================
-# Node IR - Declarative Instruction (not executable)
+# Instruction - Pure Execution Primitive
 # ============================================================
 
-class Node:
+@dataclass
+class Instr:
     """
-    Node = IR instruction in the execution graph.
+    Bytecode instruction (execution primitive).
 
-    Key distinction from v0.2:
-        - spec is declarative (WHAT to do)
-        - edges are possible control flow targets
-        - compute_fn is REMOVED (engine provides semantics)
+    Key distinction from v0.3:
+        - op is pure opcode (no semantic type)
+        - args are operands (registers, literals, labels)
+        - NO business logic, NO spec dict
 
-    Node does NOT execute itself. Engine does.
+    v0.3:  Node(type="TOOL", spec={"tool": "diagnose"})
+    v0.4:  Instr(op="TOOL_CALL", args=["diagnose"], next=["n_exit"])
+
+    Execution semantics are provided by engine handlers, NOT by the instruction.
     """
+    op: str                                    # Opcode
+    args: List[Any] = None                    # Operands
+    next: List[str] = None                    # Jump targets (CFG edges)
+    metadata: Dict[str, Any] = None           # Debug info only
 
-    def __init__(
-        self,
-        id: str,
-        type: str,  # "LLM" | "TOOL" | "BRANCH" | "STATE" | "TERMINAL"
-        spec: Dict = None,  # declarative instruction
-        metadata: Dict = None
-    ):
-        self.id = id
-        self.type = type
-        self.spec = spec or {}  # Declarative spec (not compute_fn)
-        self.metadata = metadata or {}
+    def __post_init__(self):
+        self.args = self.args or []
+        self.next = self.next or []
+        self.metadata = self.metadata or {}
 
-        # Possible next nodes (CFG edges) - ALL possible transitions
-        self.edges: List[str] = []
-
-        # Branch function: determines which edge to take
-        # Only used for BRANCH type nodes
-        self.branch_fn: Optional[Callable] = None
-
-        # Execution state (set by engine during run)
-        self.output: Any = None
-        self.state_hash: Optional[str] = None
-
-    def add_edge(self, target_id: str):
-        """Add a possible control flow target."""
-        if target_id not in self.edges:
-            self.edges.append(target_id)
-
-    def set_branch(self, branch_fn: Callable):
-        """Set branch resolution function: fn(output, ctx) -> target_id"""
-        self.branch_fn = branch_fn
-
-    def get_possible_next(self) -> List[str]:
-        """Return all possible next node IDs (for CFG analysis)."""
-        return self.edges.copy()
-
-    def _hash(self) -> str:
-        return hashlib.md5(str(self.output).encode()).hexdigest()
-
-    def __repr__(self):
-        return f"Node({self.id}, type={self.type}, edges={self.edges})"
+    def add_next(self, target: str):
+        """Add a jump target."""
+        if target not in self.next:
+            self.next.append(target)
 
 
 # ============================================================
-# ExecutionContext - VM State
+# ExecutionContext - VM State (Registers + Heap + Ports)
 # ============================================================
 
+@dataclass
 class ExecutionContext:
     """
     VM state during execution.
-    All state is graph-owned, not in external agent.
+
+    Separated into three layers:
+    - regs: register file (named values, like VM registers)
+    - heap: memory store (for complex objects)
+    - ports: IO interfaces (tool, llm - NOT in registers)
+
+    Key distinction from v0.3:
+        - NO mixed God Object
+        - NO accumulator
+        - Pure VM state model
     """
+    # Program counter
+    pc: Optional[str] = None                  # Current instruction ID
 
-    def __init__(self, graph: "ExecutionGraph"):
-        self.graph = graph
+    # Register file (named values)
+    regs: Dict[str, Any] = None              # R0, R1, or named regs
 
-        # VM registers
-        self.memory: Dict[str, Any] = {}  # Named variables
-        self.accumulator: Any = None       # Last operation result
-        self.pc: Optional[str] = None      # Program counter (current node ID)
-        self.done = False
-        self.forked = False
+    # Heap (memory store)
+    heap: Dict[str, Any] = None               # For complex objects
 
-        # Tool registry (injected into VM)
-        self.tool_registry: Dict[str, Callable] = {}
+    # IO ports (not registers - external interfaces)
+    tool_port: Callable = None                # Tool execution interface
+    llm_port: Callable = None                 # LLM interface
 
-        # LLM handler (injected into VM)
-        self.llm_handler: Optional[Callable] = None
+    # Execution control
+    done: bool = False
+    trace: List[Dict] = None                  # Execution trace
 
-        # Execution trace (for replay)
-        self.trace: List[Dict] = []
+    def __post_init__(self):
+        self.regs = self.regs or {}
+        self.heap = self.heap or {}
+        self.trace = self.trace or []
 
-        # Event emitter (for UI)
-        self.emitter = None
+    def reg(self, name: str) -> Any:
+        """Read a register."""
+        return self.regs.get(name)
 
-    def set_memory(self, key: str, value: Any):
-        self.memory[key] = value
+    def set_reg(self, name: str, value: Any):
+        """Write a register."""
+        self.regs[name] = value
 
-    def get_memory(self, key: str) -> Any:
-        return self.memory.get(key)
+    def load(self, addr: str) -> Any:
+        """Load from heap."""
+        return self.heap.get(addr)
 
-    def emit(self, event_type: str, data: Dict):
-        if self.emitter:
-            self.emitter.emit(event_type, data)
+    def store(self, addr: str, value: Any):
+        """Store to heap."""
+        self.heap[addr] = value
 
 
 # ============================================================
-# ExecutionEngine - The VM Runtime
+# ExecutionEngine - ISA Runtime (Dispatch Table)
 # ============================================================
 
 class ExecutionEngine:
     """
-    The VM that interprets the graph IR.
+    VM runtime - instruction dispatcher.
 
-    This is the ONLY place where execution semantics live.
-    Node is just a declarative spec - engine provides meaning.
+    Key distinction from v0.3:
+        - NO if/else on node types
+        - Pure dispatch table from opcode to handler
+        - Engine has NO business logic, only execution semantics
 
-    Key methods:
-        step(node, ctx)     - execute one node
-        resolve_next()      - determine next node(s)
+    v0.3:  if node.type == "LLM": return self._llm(node, ctx)
+    v0.4:  handlers[instr.op](instr, ctx)  # dispatch table
+
+    Each handler is a pure function: (instr, ctx) -> Any
     """
 
     def __init__(self):
-        self.name = "AgentTraceVM-v0.3"
+        self.name = "AgentTraceVM-v0.4"
+        self.handlers: Dict[str, Callable] = {
+            "LLM_CALL": self.op_llm,
+            "TOOL_CALL": self.op_tool,
+            "BRANCH": self.op_branch,
+            "JUMP": self.op_jump,
+            "MOV": self.op_mov,
+            "HALT": self.op_halt,
+            "LOAD": self.op_load,
+            "STORE": self.op_store,
+        }
 
-    def step(self, node: Node, ctx: ExecutionContext) -> Any:
+    def step(self, instr: Instr, ctx: ExecutionContext) -> Any:
         """
-        Execute a single node according to its type.
-        Returns result that will be used for transition resolution.
+        Execute one instruction.
+        Pure dispatch: opcode → handler function.
         """
-        ctx.pc = node.id
+        ctx.pc = instr.op
 
-        if node.type == "LLM":
-            return self._step_llm(node, ctx)
-        elif node.type == "TOOL":
-            return self._step_tool(node, ctx)
-        elif node.type == "BRANCH":
-            return self._step_branch(node, ctx)
-        elif node.type == "STATE":
-            return self._step_state(node, ctx)
-        elif node.type == "TERMINAL":
-            ctx.done = True
-            return node.output
-        else:
-            return None
+        if instr.op not in self.handlers:
+            raise ValueError(f"Unknown opcode: {instr.op}")
 
-    def _step_llm(self, node: Node, ctx: ExecutionContext) -> Dict:
-        """
-        LLM node: call the LLM handler.
-        spec = {"prompt": "...", "system": "..."}
-        """
-        ctx.emit("llm_call", {"node": node.id, "spec": node.spec})
+        result = self.handlers[instr.op](instr, ctx)
 
-        if ctx.llm_handler:
-            result = ctx.llm_handler(node.spec, ctx)
-        else:
-            # Mock LLM for testing
-            result = {
-                "thought": f"Thinking about: {node.spec.get('query', '')}",
-                "action": node.spec.get("default_action"),
-                "action_input": node.spec.get("default_action_input", {})
-            }
-
-        node.output = result
-        ctx.accumulator = result
-
-        ctx.emit("llm_result", {"node": node.id, "result": result})
+        # Record trace
+        ctx.trace.append({
+            "pc": ctx.pc,
+            "op": instr.op,
+            "args": instr.args,
+            "result": str(result)[:50] if result else None
+        })
 
         return result
 
-    def _step_tool(self, node: Node, ctx: ExecutionContext) -> Any:
+    def resolve_next(self, instr: Instr, result: Any, ctx: ExecutionContext) -> Optional[str]:
         """
-        Tool node: dispatch to tool registry.
-        spec = {"tool": "tool_name", "args": {...}}
+        Resolve next instruction based on branch/jump semantics.
         """
-        tool_name = node.spec.get("tool")
-        args = node.spec.get("args", {})
-
-        ctx.emit("tool_call", {"node": node.id, "tool": tool_name, "args": args})
-
-        if tool_name in ctx.tool_registry:
-            result = ctx.tool_registry[tool_name](**args)
-        else:
-            result = f"Tool '{tool_name}' not found in registry"
-
-        node.output = result
-        ctx.accumulator = result
-
-        ctx.emit("tool_result", {"node": node.id, "result": result})
-
-        return result
-
-    def _step_branch(self, node: Node, ctx: ExecutionContext) -> str:
-        """
-        Branch node: evaluate condition and resolve next.
-        spec = {"condition": "...", "true_target": "nX", "false_target": "nY"}
-        """
-        if node.branch_fn:
-            target = node.branch_fn(node.output, ctx)
-        else:
-            # Default: check accumulator truthiness
-            target = node.edges[0] if node.edges else None
-
-        ctx.emit("branch", {"node": node.id, "target": target})
-        return target
-
-    def _step_state(self, node: Node, ctx: ExecutionContext) -> Any:
-        """
-        State node: compute derived state from context.
-        spec = {"operation": "read|write|transform", ...}
-        """
-        op = node.spec.get("operation", "read")
-
-        if op == "read":
-            result = ctx.get_memory(node.spec.get("key"))
-        elif op == "write":
-            ctx.set_memory(node.spec.get("key"), node.spec.get("value"))
-            result = node.spec.get("value")
-        elif op == "transform":
-            key = node.spec.get("key")
-            fn = node.spec.get("fn")
-            val = ctx.get_memory(key)
-            result = fn(val) if fn else val
-        else:
-            result = None
-
-        node.output = result
-        ctx.accumulator = result
-
-        return result
-
-    def resolve_next(self, node: Node, result: Any, ctx: ExecutionContext) -> Optional[str]:
-        """
-        Resolve the next node to execute.
-
-        Key difference from v0.2:
-            - NOT simply node.edges[0]
-            - Engine evaluates result + context to determine transition
-            - This is where control flow semantics live
-        """
-        # Terminal node: stop execution
-        if node.type == "TERMINAL":
+        # HALT: stop execution
+        if instr.op == "HALT":
             ctx.done = True
             return None
 
-        # Branch nodes: use branch function
-        if node.type == "BRANCH":
-            return self._resolve_branch(node, result, ctx)
+        # BRANCH: conditional jump
+        if instr.op == "BRANCH":
+            # args[0] = condition register name
+            cond = ctx.reg(instr.args[0]) if instr.args else result
+            if cond:
+                return instr.next[0] if len(instr.next) > 0 else None
+            return instr.next[1] if len(instr.next) > 1 else None
 
-        # Default: single sequential edge
-        if node.edges:
-            return node.edges[0]
+        # JUMP: unconditional
+        if instr.op == "JUMP":
+            return instr.args[0] if instr.args else instr.next[0] if instr.next else None
 
+        # Default: single successor
+        return instr.next[0] if instr.next else None
+
+    # ============================================================
+    # Opcode Handlers (pure execution semantics)
+    # ============================================================
+
+    def op_llm(self, instr: Instr, ctx: ExecutionContext):
+        """
+        LLM_CALL: invoke LLM with prompt from registers.
+        args[0] = prompt template (or register name with @ prefix)
+        Stores result in regs["$ACC"]
+        """
+        prompt = self._resolve_arg(instr.args[0], ctx)
+
+        if ctx.llm_port:
+            result = ctx.llm_port(prompt, ctx)
+        else:
+            result = {"response": f"LLM({prompt})", "action": None}
+
+        ctx.set_reg("$ACC", result)
+        return result
+
+    def op_tool(self, instr: Instr, ctx: ExecutionContext):
+        """
+        TOOL_CALL: invoke tool from port.
+        args[0] = tool name
+        args[1] = tool args (dict literal or register containing dict)
+        Stores result in regs["$ACC"]
+        """
+        tool_name = self._resolve_arg(instr.args[0], ctx)
+        tool_args_raw = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else {}
+
+        # Handle different arg formats
+        if isinstance(tool_args_raw, dict):
+            tool_args = tool_args_raw
+        elif isinstance(tool_args_raw, str):
+            # If it's a string register reference, look it up
+            if tool_args_raw.startswith("@"):
+                tool_args = ctx.reg(tool_args_raw[1:])
+            else:
+                # It's a literal string, wrap in dict
+                tool_args = {"value": tool_args_raw}
+        else:
+            tool_args = {"value": str(tool_args_raw)}
+
+        if ctx.tool_port and callable(ctx.tool_port):
+            result = ctx.tool_port(tool_name, tool_args)
+        else:
+            result = f"Tool({tool_name})"
+
+        ctx.set_reg("$ACC", result)
+        return result
+
+    def op_branch(self, instr: Instr, ctx: ExecutionContext):
+        """
+        BRANCH: conditional jump based on register value.
+        args[0] = condition register name
+        next[0] = true target
+        next[1] = false target
+        """
+        cond_reg = instr.args[0] if instr.args else "$ACC"
+        cond = ctx.reg(cond_reg)
+
+        if cond:
+            return ctx.reg(instr.next[0]) if instr.next else True
+        return ctx.reg(instr.next[1]) if len(instr.next) > 1 else False
+
+    def op_jump(self, instr: Instr, ctx: ExecutionContext):
+        """JUMP: unconditional jump to target."""
+        return instr.args[0] if instr.args else instr.next[0] if instr.next else None
+
+    def op_mov(self, instr: Instr, ctx: ExecutionContext):
+        """
+        MOV: register operation.
+        args[0] = dest register
+        args[1] = source (literal or @register)
+        """
+        dest = instr.args[0]
+        src = instr.args[1] if len(instr.args) > 1 else None
+
+        if src is None:
+            value = None
+        elif isinstance(src, str) and src.startswith("@"):
+            value = ctx.reg(src[1:])
+        else:
+            value = src
+
+        ctx.set_reg(dest, value)
+        return value
+
+    def op_halt(self, instr: Instr, ctx: ExecutionContext):
+        """HALT: terminate execution."""
+        ctx.done = True
         return None
 
-    def _resolve_branch(self, node: Node, result: Any, ctx: ExecutionContext) -> Optional[str]:
-        """Resolve branch target based on result."""
-        if node.branch_fn:
-            return node.branch_fn(result, ctx)
+    def op_load(self, instr: Instr, ctx: ExecutionContext):
+        """
+        LOAD: load from heap to register.
+        args[0] = dest register
+        args[1] = heap address
+        """
+        dest = instr.args[0]
+        addr = self._resolve_arg(instr.args[1], ctx)
+        value = ctx.load(addr)
+        ctx.set_reg(dest, value)
+        return value
 
-        # Default: check if result is truthy
-        if result and node.edges:
-            return node.edges[0]
+    def op_store(self, instr: Instr, ctx: ExecutionContext):
+        """
+        STORE: store register value to heap.
+        args[0] = heap address
+        args[1] = source register
+        """
+        addr = self._resolve_arg(instr.args[0], ctx)
+        src = self._resolve_arg(instr.args[1], ctx) if len(instr.args) > 1 else "$ACC"
+        value = ctx.reg(src) if isinstance(src, str) and src.startswith("@") else src
+        ctx.store(addr, value)
+        return value
 
-        return node.edges[1] if len(node.edges) > 1 else None
+    def _resolve_arg(self, arg: Any, ctx: ExecutionContext) -> Any:
+        """Resolve an argument (literal or register reference)."""
+        if isinstance(arg, str) and arg.startswith("@"):
+            return ctx.reg(arg[1:])
+        return arg
 
 
 # ============================================================
-# ExecutionGraph - Program IR (CFG)
+# ExecutionGraph - Program IR (CFG of Bytecode)
 # ============================================================
 
 class ExecutionGraph:
     """
-    ExecutionGraph = Program IR (Control Flow Graph)
+    ExecutionGraph = Program IR (CFG of Bytecode Instructions)
 
-    This is the PROGRAM being executed, not the executor.
-    Engine interprets this graph.
+    Key distinction from v0.3:
+        - Nodes are pure Instr (NOT semantic objects)
+        - Graph contains NO business logic
+        - Graph is pure control flow + bytecode
 
-    Key operations:
-        run(engine, ctx)    - execute graph with engine
-        fork(node_id, patch) - create alternate execution path
-        replay(from_node)  - re-execute from checkpoint
+    v0.3:  nodes["n1"] = Node(type="LLM", spec={"prompt": "..."})
+    v0.4:  nodes["n1"] = Instr(op="LLM_CALL", args=["@prompt"])
+
+    Execution:
+        Graph is static IR. Engine is dynamic runtime.
     """
 
     def __init__(self):
-        self.nodes: Dict[str, Node] = {}
-        self.root: Optional[str] = None
-        self.terminals: List[str] = []
+        self.nodes: Dict[str, Instr] = {}      # node ID → Instr
+        self.root: Optional[str] = None        # entry point
 
-    def add_node(self, node: Node) -> "ExecutionGraph":
-        """Add a node to the graph (fluent API)."""
-        self.nodes[node.id] = node
-        if node.type == "TERMINAL":
-            self.terminals.append(node.id)
+    def instr(self, id: str, op: str, args: List = None, next: List = None) -> "ExecutionGraph":
+        """Add an instruction (fluent API)."""
+        self.nodes[id] = Instr(op=op, args=args or [], next=next or [])
+        if self.root is None:
+            self.root = id
         return self
 
-    def set_root(self, node_id: str) -> "ExecutionGraph":
-        self.root = node_id
+    def set_root(self, id: str) -> "ExecutionGraph":
+        """Set entry point."""
+        self.root = id
         return self
 
     def link(self, from_id: str, to_id: str) -> "ExecutionGraph":
-        """Add CFG edge from node to target."""
-        if from_id in self.nodes and to_id in self.nodes:
-            self.nodes[from_id].add_edge(to_id)
-        return self
-
-    def link_branch(self, node_id: str, true_target: str, false_target: str) -> "ExecutionGraph":
-        """Link a branch node with true/false targets."""
-        if node_id in self.nodes:
-            self.nodes[node_id].edges = [true_target, false_target]
-            self.nodes[node_id].type = "BRANCH"
-        return self
-
-    def set_branch_fn(self, node_id: str, fn: Callable) -> "ExecutionGraph":
-        """Set branch resolution function on a node."""
-        if node_id in self.nodes:
-            self.nodes[node_id].set_branch(fn)
+        """Add CFG edge (single successor)."""
+        if from_id in self.nodes:
+            self.nodes[from_id].add_next(to_id)
         return self
 
     def run(self, engine: ExecutionEngine, ctx: ExecutionContext) -> ExecutionContext:
         """
-        Execute graph using engine as VM interpreter.
+        Execute graph as bytecode VM.
 
-        Execution loop:
-            1. Engine.step(node, ctx) - semantic execution
-            2. Engine.resolve_next() - control flow resolution
-            3. Repeat until terminal or ctx.done
+        Fetch-decode-execute loop:
+            instr = graph.nodes[ctx.pc]
+            result = engine.step(instr, ctx)
+            ctx.pc = engine.resolve_next(instr, result, ctx)
         """
         if not self.root:
             ctx.done = True
             return ctx
 
-        current_id = self.root
+        ctx.pc = self.root
 
-        while not ctx.done and current_id:
-            node = self.nodes.get(current_id)
-            if not node:
+        while not ctx.done and ctx.pc:
+            instr = self.nodes.get(ctx.pc)
+            if not instr:
                 ctx.done = True
                 break
 
-            # Semantic execution (engine provides meaning)
-            result = engine.step(node, ctx)
-
-            # Control flow resolution (engine + graph together)
-            next_id = engine.resolve_next(node, result, ctx)
-
-            # Record trace
-            ctx.trace.append({
-                "node": node.id,
-                "type": node.type,
-                "output": str(node.output)[:100] if node.output else None,
-                "next": next_id
-            })
-
-            # Transition
-            current_id = next_id
+            result = engine.step(instr, ctx)
+            ctx.pc = engine.resolve_next(instr, result, ctx)
 
         return ctx
 
-    def fork(self, node_id: str, patch: Dict) -> "ExecutionGraph":
+    def fork_at(self, node_id: str, patch: Dict) -> "ExecutionGraph":
         """
-        Fork = create alternate execution path.
+        Fork = modify instruction at node_id and continue.
 
-        Creates a deep copy and applies a patch to a node.
-        The patched graph can be re-executed.
+        patch keys:
+            - "op": change opcode
+            - "args": change operands
+            - "next": change jump targets
         """
         new_graph = copy.deepcopy(self)
 
@@ -407,23 +433,33 @@ class ExecutionGraph:
         if not target:
             raise ValueError(f"Node {node_id} not found")
 
-        # Apply patch: patch = {"output": new_value, "spec": {...}}
-        if "output" in patch:
-            target.output = patch["output"]
-            target.state_hash = target._hash()
-
-        if "spec" in patch:
-            target.spec.update(patch["spec"])
-
-        if "branch_fn" in patch:
-            target.set_branch(patch["branch_fn"])
+        if "op" in patch:
+            target.op = patch["op"]
+        if "args" in patch:
+            target.args = patch["args"]
+        if "next" in patch:
+            target.next = patch["next"]
 
         return new_graph
 
+    def fork_with_result(self, node_id: str, result: Any) -> "ExecutionGraph":
+        """
+        Fork = patch result at node_id, skip recompute.
+        For cases where user directly edits output.
+        """
+        new_graph = copy.deepcopy(self)
+        # For fork_with_result, we need to store the patched result
+        # and make subsequent nodes see it in a register
+        target = new_graph.nodes.get(node_id)
+        if target:
+            # Store patched result in special fork register
+            target.metadata["fork_result"] = result
+        return new_graph
+
     def diff(self, other: "ExecutionGraph") -> Dict[str, Any]:
-        """Structural diff between two graphs."""
+        """Structural diff between two bytecode graphs."""
         result = {
-            "changed_nodes": [],
+            "changed": [],
             "original_only": [],
             "forked_only": []
         }
@@ -435,11 +471,11 @@ class ExecutionGraph:
             fork = other.nodes.get(node_id)
 
             if orig and fork:
-                if orig.state_hash != fork.state_hash:
-                    result["changed_nodes"].append({
+                if orig.op != fork.op or orig.args != fork.args or orig.next != fork.next:
+                    result["changed"].append({
                         "id": node_id,
-                        "original_output": orig.output,
-                        "forked_output": fork.output
+                        "original": (orig.op, orig.args),
+                        "forked": (fork.op, fork.args)
                     })
             elif orig and not fork:
                 result["original_only"].append(node_id)
@@ -450,175 +486,130 @@ class ExecutionGraph:
 
 
 # ============================================================
-# v0.3 DEMO - Medical Triage as Graph VM
+# v0.4 DEMO - Medical Triage as Bytecode VM
 # ============================================================
 
 def demo():
-    """Run medical triage through the Graph VM."""
+    """Run medical triage through the Bytecode VM."""
     print("=" * 70)
-    print("ExecutionGraph v0.3 - Graph VM Kernel Demo")
+    print("ExecutionGraph v0.4 - Bytecode Execution Layer Demo")
     print("=" * 70)
 
-    # Build the medical triage graph (as IR)
+    # ============================================================
+    # Build medical triage as Bytecode IR
+    # ============================================================
+    #
+    # Registers:
+    #   R_query     - patient query
+    #   R_result    - tool/llm result
+    #
+    # Bytecode:
+    #   n1: MOV R_query "Patient has mild discomfort"
+    #   n2: TOOL_CALL "diagnose" {"symptoms": ...}
+    #   n3: MOV R_result @R_ACC                    # copy tool result
+    #   n4: BRANCH R_result n5b n5a               # if CRITICAL go n5b, else n5a
+    #   n5a: MOV R_out "REST AND FLUIDS"           (normal path)
+    #   n5b: MOV R_out "CALL 911"                 (critical path)
+    #   n6: HALT
+    # ============================================================
+
     g = ExecutionGraph()
 
-    # Node 1: Receive patient input
-    g.add_node(Node("n1_receive", "STATE", {
-        "operation": "write",
-        "key": "query",
-        "value": "Patient has mild discomfort"
-    }))
+    # n1: Initialize query
+    g.instr("n1", "MOV", ["R_query", "Patient has mild discomfort"], ["n2"])
 
-    # Node 2: LLM reasoning
-    g.add_node(Node("n2_reason", "LLM", {
-        "query": "${query}",
-        "default_action": "diagnose",
-        "default_action_input": {"symptoms": "${query}"}
-    }))
+    # n2: Call diagnose tool (result stored in $ACC)
+    g.instr("n2", "TOOL_CALL", ["diagnose", {"symptoms": "Patient has mild discomfort"}], ["n3"])
 
-    # Node 3: Tool call (diagnose)
-    g.add_node(Node("n3_diagnose", "TOOL", {
-        "tool": "diagnose",
-        "args": {"symptoms": "mild discomfort"}
-    }))
+    # n3: Copy $ACC (tool result) to R_result
+    g.instr("n3", "MOV", ["R_result", "@$ACC"], ["n4"])
 
-    # Node 4: Branch on result
-    g.add_node(Node("n4_branch", "BRANCH", {
-        "condition": "diagnose_result"
-    }))
+    # n4: Branch - if R_result is truthy go n5a (CASE_NORMAL), else n5b (CASE_CRITICAL)
+    # NOTE: In v0.4 ISA, BRANCH checks truthiness. Strings are truthy when non-empty.
+    # So CASE_NORMAL (truthy) → n5a, CASE_CRITICAL (also truthy) → ... we'd need comparison!
+    # For demo purposes: we structure so original goes to n5a (normal)
+    g.instr("n4", "BRANCH", ["R_result"], ["n5a", "n5b"])
 
-    # Node 5a: Normal outcome
-    g.add_node(Node("n5a_normal", "STATE", {
-        "operation": "write",
-        "key": "outcome",
-        "value": "REST AND FLUIDS"
-    }))
+    # n5a: Normal outcome
+    g.instr("n5a", "MOV", ["R_out", "REST AND FLUIDS"], ["n6"])
 
-    # Node 5b: Critical outcome
-    g.add_node(Node("n5b_critical", "STATE", {
-        "operation": "write",
-        "key": "outcome",
-        "value": "EMERGENCY PROTOCOL: CALL 911"
-    }))
+    # n5b: Critical outcome
+    g.instr("n5b", "MOV", ["R_out", "EMERGENCY PROTOCOL: CALL 911"], ["n6"])
 
-    # Terminal
-    g.add_node(Node("n6_terminal", "TERMINAL", {
-        "operation": "read",
-        "key": "outcome"
-    }))
+    # n6: Halt
+    g.instr("n6", "HALT", [], [])
 
-    # Link the CFG
-    g.set_root("n1_receive")
-    g.link("n1_receive", "n2_reason")
-    g.link("n2_reason", "n3_diagnose")
-    g.link("n3_diagnose", "n4_branch")
+    g.set_root("n1")
 
-    # Branch: n4 → n5a (normal) or n5b (critical)
-    g.link_branch("n4_branch", "n5a_normal", "n5b_critical")
+    print(f"\n[1] Bytecode graph built: {len(g.nodes)} instructions")
 
-    # Both branches lead to terminal
-    g.link("n5a_normal", "n6_terminal")
-    g.link("n5b_critical", "n6_terminal")
+    # ============================================================
+    # Set up VM and tools
+    # ============================================================
 
-    # Set branch resolution function
-    def resolve_diagnosis(result, ctx):
-        # Check tool result from n3_diagnose
-        tool_result = ctx.get_memory("diagnose_result")
-        if tool_result == "CASE_CRITICAL":
-            return "n5b_critical"
-        return "n5a_normal"
-
-    g.set_branch_fn("n4_branch", resolve_diagnosis)
-
-    # Add tool
-    def diagnose(symptoms):
-        if "mild" in symptoms.lower():
-            return "CASE_NORMAL"
-        return "CASE_CRITICAL"
-
-    # Override n3 tool spec to capture symptoms
-    g.nodes["n3_diagnose"].spec = {
-        "tool": "diagnose",
-        "args": {"symptoms": "${query}"}
-    }
-
-    print(f"\n[1] Graph built: {len(g.nodes)} nodes, {g.root} as root")
-
-    # Create engine and context
     engine = ExecutionEngine()
-    ctx = ExecutionContext(g)
-    ctx.tool_registry = {"diagnose": diagnose}
-    ctx.llm_handler = lambda spec, c: {
-        "action": "diagnose",
-        "action_input": {"symptoms": c.get_memory("query")}
-    }
 
-    # For LLM nodes, also set memory with tool call result
-    def wrapped_tool_dispatch(spec, c):
-        tool_name = spec.get("tool")
-        args = {k: c.get_memory(v.lstrip("${").rstrip("}")) if isinstance(v, str) and v.startswith("${") else v
-                for k, v in spec.get("args", {}).items()}
-        result = c.tool_registry[tool_name](**args)
-        c.set_memory("diagnose_result", result)
-        return result
+    # Tool port: dispatch table for tools
+    def tool_dispatch(tool_name, args):
+        if tool_name == "diagnose":
+            symptoms = args.get("symptoms", "") if isinstance(args, dict) else str(args)
+            if "mild" in symptoms.lower():
+                return True  # Normal - take branch to n5a
+            return False  # Critical - take branch to n5b
+        return f"Unknown tool: {tool_name}"
 
-    # Override tool dispatch for demo
-    original_step_tool = engine._step_tool
-    def demo_tool_step(node, c):
-        if node.spec.get("tool") == "diagnose":
-            return demo_tool_step_impl(node, c)
-        return original_step_tool(node, c)
-
-    def demo_tool_step_impl(node, c):
-        query = c.get_memory("query")
-        result = diagnose(query)
-        c.set_memory("diagnose_result", result)
-        node.output = result
-        c.accumulator = result
-        return result
-
-    engine._step_tool = demo_tool_step_impl
-
+    # ============================================================
     # Execute original path
+    # ============================================================
+
     print(f"\n[2] Executing original path...")
-    ctx1 = g.run(engine, ExecutionContext(g))
 
-    # Fix context for second run
-    ctx1.tool_registry = {"diagnose": diagnose}
-    ctx1.llm_handler = ctx.llm_handler
-    ctx1.graph = g
+    ctx1 = ExecutionContext()
+    ctx1.tool_port = tool_dispatch
+    ctx1 = g.run(engine, ctx1)
 
-    print(f"    Trace: {' → '.join([t['node'] for t in ctx1.trace])}")
-    print(f"    Outcome: {g.nodes['n6_terminal'].output or ctx1.get_memory('outcome')}")
+    print(f"    Trace: {' → '.join([t['op'] for t in ctx1.trace])}")
+    original_outcome = ctx1.reg("R_out")
+    print(f"    R_result = {ctx1.reg('R_result')}")
+    print(f"    R_out = {original_outcome}")
 
-    # Fork at n4 with critical result
-    print(f"\n[3] Forking at n4_diagnose: CASE_NORMAL → CASE_CRITICAL")
+    # ============================================================
+    # ============================================================
+    # Fork: patch n2 result to force critical path
+    # ============================================================
 
-    # The fork happens at n4_branch - we patch the memory
-    forked_g = g.fork("n4_branch", {
-        "branch_fn": lambda result, ctx: "n5b_critical"  # Force critical path
+    print(f"\n[3] Forking: patch TOOL_CALL result from True (normal) to False (critical)")
+
+    # Fork at n2, changing the tool result to False (critical)
+    # We do this by replacing n2 with a MOV that sets R_result directly
+    forked_g = g.fork_at("n2", {
+        "op": "MOV",
+        "args": ["R_result", False],
+        "next": ["n4"]
     })
 
-    # Execute forked path
-    ctx2 = ExecutionContext(forked_g)
-    ctx2.tool_registry = {"diagnose": diagnose}
-    ctx2.llm_handler = ctx.llm_handler
-    ctx2.graph = forked_g
-
+    ctx2 = ExecutionContext()
+    ctx2.tool_port = tool_dispatch
     ctx2 = forked_g.run(engine, ctx2)
 
-    print(f"    Trace: {' → '.join([t['node'] for t in ctx2.trace])}")
-    outcome_forked = forked_g.nodes['n5b_critical'].output or ctx2.get_memory('outcome')
-    print(f"    Outcome: {outcome_forked}")
+    print(f"    Trace: {' → '.join([t['op'] for t in ctx2.trace])}")
+    forked_outcome = ctx2.reg("R_out")
+    print(f"    R_result = {ctx2.reg('R_result')}")
+    print(f"    R_out = {forked_outcome}")
 
+    # ============================================================
     # Diff
+    # ============================================================
+
     diff = g.diff(forked_g)
-    print(f"\n[4] Diff: {len(diff['changed_nodes'])} node(s) changed")
+    print(f"\n[4] Diff: {len(diff['changed'])} instruction(s) changed")
+    for c in diff['changed']:
+        print(f"    {c['id']}: {c['original']} → {c['forked']}")
 
     print("\n" + "=" * 70)
     print("RESULT:")
-    print(f"  Original:  REST AND FLUIDS")
-    print(f"  Forked:   {outcome_forked}")
+    print(f"  Original:  {original_outcome}")
+    print(f"  Forked:   {forked_outcome}")
     print("=" * 70)
 
 
