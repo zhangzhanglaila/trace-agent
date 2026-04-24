@@ -25,7 +25,11 @@
       "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); from agenttrace import *; import json; args = type\\('Args', \\(\\), {'case': 'examples/case_mild_discomfort.json'}\\)\\(\\); cmd_explain\\(args\\)\")",
       "Bash(python agenttrace.py minimal examples/case_mild_discomfort.json)",
       "Bash(python agenttrace.py why-not --outcome \"CALL 911\" examples/case_mild_discomfort.json)",
-      "Bash(python agenttrace.py classify examples/case_mild_discomfort.json)"
+      "Bash(python agenttrace.py classify examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py intervene examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py counterfactual examples/case_mild_discomfort.json)",
+      "Bash(python agenttrace.py export-scm examples/case_mild_discomfort.json)",
+      "Bash(python:*)"
     ]
   }
 }

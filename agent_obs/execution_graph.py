@@ -1135,37 +1135,142 @@ class SemanticResolver:
 
         return critical_path if critical_path else full_path
 
-    def find_minimal_causal_set(self, target_node: str, graph: "ExecutionGraph") -> Dict:
+    def prune_causal_graph(self, graph: "ExecutionGraph") -> Dict[str, Set[str]]:
         """
-        Find the minimal set of variables that must change to alter the outcome.
+        Prune dependency graph to get true causal graph.
 
-        Uses powerset enumeration (small DAG, feasible) to find minimal intervention set.
-        Returns: {
-            "outcome": current outcome,
-            "minimal_set": [vars that must be flipped together],
-            "alternatives": [{"vars": [...], "outcome": ...}, ...]
-        }
+        Edge-level causal检验:
+        Edge X → Y exists iff do(X=x') actually changes Y specifically.
+
+        Algorithm:
+        - For each edge X → Y in raw dependency graph
+        - Test: do(X=x') changes Y specifically? (not just R_out)
+        - If yes → keep edge X → Y
+        - If no → remove edge (not truly causal)
+
+        Returns: {source_var: {target_vars that causally depend on source_var}}
         """
-        # Get all candidate variables
+        raw_graph = self.build_variable_causal_graph(graph)
+
+        # Domain mapping
+        domains = {
+            "R_flag": [False, True],
+            "R_result": ["CASE_NORMAL", "CASE_CRITICAL"],
+        }
+
+        causal_edges = {}  # var -> set of causally dependent vars (edge-level)
+
+        for source_var, target_vars in raw_graph.items():
+            if source_var not in domains:
+                # Unknown domain - conservatively keep all edges from this source
+                if source_var not in causal_edges:
+                    causal_edges[source_var] = set()
+                causal_edges[source_var] = causal_edges[source_var].union(target_vars)
+                continue
+
+            # For each target, test if do(X) changes that specific target
+            for target_var in target_vars:
+                is_causal = False
+
+                for alt_val in domains[source_var]:
+                    engine = ExecutionEngine(self)
+
+                    # Baseline: normal execution
+                    ctx_base = VMContext()
+                    ctx_base = graph.run(engine, ctx_base)
+                    baseline_target = ctx_base.regs.get(target_var, None)
+                    baseline_outcome = ctx_base.regs.get("R_out", "")
+
+                    # Intervention: do(X=alt_val)
+                    ctx_alt = VMContext()
+                    ctx_alt.clamped[source_var] = alt_val
+                    ctx_alt.regs[source_var] = alt_val
+                    ctx_alt = graph.run(engine, ctx_alt)
+                    alt_target = ctx_alt.regs.get(target_var, None)
+                    alt_outcome = ctx_alt.regs.get("R_out", "")
+
+                    # Edge is causal ONLY if target variable specifically changes
+                    # This is the strict SCM definition: X→Y iff do(X=x') changes Y
+                    # We do NOT use outcome as fallback - that would reintroduce the node-level bug
+                    if baseline_target != alt_target:
+                        is_causal = True
+                        break
+
+                if source_var not in causal_edges:
+                    causal_edges[source_var] = set()
+                if is_causal:
+                    causal_edges[source_var].add(target_var)
+
+        return causal_edges
+
+    def build_variable_causal_graph(self, graph: "ExecutionGraph") -> Dict[str, List[str]]:
+        """
+        Build variable-level causal graph from IR.
+
+        For each instruction: for each write w, for each read r,
+        add edge r → w (r is upstream cause of w).
+
+        Returns: {variable: [variables that depend on it]}
+        """
+        causal_graph = {}  # var -> vars that depend on it
+
+        for node_id, instr in self.ir.items():
+            for written in instr.writes:
+                if written not in causal_graph:
+                    causal_graph[written] = []
+                # For each variable this writes to, add edges from what it reads
+                for read in instr.reads:
+                    if read not in causal_graph:
+                        causal_graph[read] = []
+                    if written not in causal_graph[read]:
+                        causal_graph[read].append(written)
+
+        return causal_graph
+
+    def find_minimal_causal_sets(self, target_node: str, graph: "ExecutionGraph") -> Dict:
+        """
+        Find ALL minimal causal sets using proper powerset enumeration with pruning.
+
+        A minimal causal set is a set of variables such that:
+        - Intervening on all of them changes the outcome
+        - No proper subset of them changes the outcome (Halpern-Pearl minimality)
+
+        Uses causal graph pruning to reduce search space:
+        - Only consider edges that are truly causal (do(X=x) changes Y)
+
+        Pruning: if subset S achieves outcome O, skip all supersets of S
+        """
         target_instr = self.ir.get(target_node)
         if not target_instr:
             return {}
 
-        test_vars = []
+        # Get domain for each variable first (needed before causal graph filtering)
+        domains = {}
         if target_instr.op == "BRANCH" and target_instr.args:
-            test_vars.append(target_instr.args[0])
+            test_vars = [target_instr.args[0]]
         else:
             test_vars = list(target_instr.reads)
 
-        # Get domain for each variable
-        domains = {}
         for v in test_vars:
             if v == "R_flag":
                 domains[v] = [False, True]
             elif v == "R_result":
                 domains[v] = ["CASE_NORMAL", "CASE_CRITICAL"]
-            else:
-                continue
+
+        if not domains:
+            return {}
+
+        # Get candidate variables from pruned causal graph
+        # A variable is relevant if it's in the domain AND has causal edges
+        causal_graph = self.prune_causal_graph(graph)
+        # Keep vars that either:
+        # 1. Have causal edges in the graph (outgoing edges exist)
+        # 2. Are in the domains (known intervention targets)
+        filtered_vars = [v for v in test_vars if v in domains and (v in causal_graph and len(causal_graph[v]) > 0)]
+
+        # If no vars have causal edges, fall back to all vars with domains
+        if not filtered_vars:
+            filtered_vars = [v for v in test_vars if v in domains]
 
         # Baseline execution
         engine = ExecutionEngine(self)
@@ -1173,137 +1278,145 @@ class SemanticResolver:
         ctx_base = graph.run(engine, ctx_base)
         baseline_outcome = ctx_base.regs.get("R_out", "")
 
-        # Try all single-variable interventions first (greedy minimal)
-        minimal_set = None
-        for var in test_vars:
-            if var not in domains:
+        # Helper: test an intervention set using do-calculus clamped semantics
+        def test_intervention(interventions: Dict[str, Any]) -> str:
+            """Apply do(X=x) interventions and return outcome."""
+            engine_test = ExecutionEngine(self)
+            ctx_test = VMContext()
+            for var, val in interventions.items():
+                ctx_test.clamped[var] = val
+                ctx_test.regs[var] = val
+            ctx_test = graph.run(engine_test, ctx_test)
+            return ctx_test.regs.get("R_out", "")
+
+        # Enumerate interventions by increasing size (BFS + pruning)
+        minimal_sets = []
+        found_outcomes = {}  # outcome -> (size, vars)
+        # Per-outcome sufficient sets: outcome -> set of frozensets that achieve it
+        outcome_sufficient = {}  # outcome -> {frozensets}
+
+        from itertools import combinations
+
+        for size in range(1, len(filtered_vars) + 1):
+            # Per-outcome pruning: only skip if ALL outcomes have found smaller sufficient sets
+            if found_outcomes and all(size > found_outcomes[o][0] for o in found_outcomes):
+                # All remaining sizes will be larger than some found outcome - skip
                 continue
-            for alt_val in domains[var]:
-                # Fork and test
-                defs = self._get_reaching_defs(var, target_node)
-                if not defs:
+
+            for var_combo in combinations(filtered_vars, size):
+                # Per-outcome pruning: skip if superset of a sufficient set FOR THIS OUTCOME
+                # (different from original - we track per outcome)
+                combo_set = frozenset(var_combo)
+                skip_combo = False
+                for outcome, sufficient in outcome_sufficient.items():
+                    if any(s < combo_set for s in sufficient):
+                        skip_combo = True
+                        break
+                if skip_combo:
                     continue
-                fork_node = defs[0]
 
-                patched = graph.fork_at(fork_node, {
-                    "op": "MOV",
-                    "args": [var, alt_val]
-                })
-                patched.build_cfg()
+                # Try all value combinations for this variable subset
+                from itertools import product
+                var_domains = [domains.get(v, [None]) for v in var_combo]
+                for values in product(*var_domains):
+                    interventions = dict(zip(var_combo, values))
+                    outcome = test_intervention(interventions)
 
-                engine_p = ExecutionEngine(patched.semantic)
-                ctx_p = VMContext()
-                ctx_p = patched.run(engine_p, ctx_p)
-                outcome = ctx_p.regs.get("R_out", "")
-
-                if outcome != baseline_outcome:
-                    minimal_set = [var]
-                    break
-            if minimal_set:
-                break
-
-        # Find all alternative outcomes
-        alternatives = []
-        for var in test_vars:
-            if var not in domains:
-                continue
-            for alt_val in domains[var]:
-                defs = self._get_reaching_defs(var, target_node)
-                if not defs:
-                    continue
-                fork_node = defs[0]
-
-                patched = graph.fork_at(fork_node, {
-                    "op": "MOV",
-                    "args": [var, alt_val]
-                })
-                patched.build_cfg()
-
-                engine_p = ExecutionEngine(patched.semantic)
-                ctx_p = VMContext()
-                ctx_p = patched.run(engine_p, ctx_p)
-                outcome = ctx_p.regs.get("R_out", "")
-
-                if outcome != baseline_outcome:
-                    alternatives.append({
-                        "vars": {var: alt_val},
-                        "outcome": outcome
-                    })
+                    if outcome != baseline_outcome:
+                        # Found a sufficient set for this outcome
+                        if outcome not in found_outcomes or size < found_outcomes[outcome][0]:
+                            found_outcomes[outcome] = (size, interventions)
+                            minimal_sets.append({
+                                "vars": interventions,
+                                "outcome": outcome,
+                                "size": size
+                            })
+                        # Track per-outcome
+                        if outcome not in outcome_sufficient:
+                            outcome_sufficient[outcome] = set()
+                        outcome_sufficient[outcome].add(combo_set)
 
         return {
             "baseline_outcome": baseline_outcome,
-            "minimal_set": minimal_set or [],
-            "alternatives": alternatives
+            "minimal_sets": minimal_sets,
+            "all_alternatives": [{"vars": i["vars"], "outcome": i["outcome"]} for i in minimal_sets if i["size"] == 1]
         }
+
+    def find_minimal_causal_set(self, target_node: str, graph: "ExecutionGraph") -> Dict:
+        """Legacy wrapper - redirects to find_minimal_causal_sets."""
+        return self.find_minimal_causal_sets(target_node, graph)
 
     def classify_causal_types(self, target_node: str, graph: "ExecutionGraph") -> Dict[str, List]:
         """
-        Classify causes into three tiers:
-        - DECISION CAUSE: directly controls the branch outcome
-        - UPSTREAM CAUSE: determines the decision cause value
+        Classify causes into three tiers using structural analysis:
+        - DECISION CAUSE: variable that directly controls the BRANCH condition
+        - UPSTREAM CAUSE: variable that feeds into decision cause
         - CONTEXT: no effect on outcome
+
+        Uses variable causal graph for structural classification.
         """
+        # Build variable causal graph
+        var_graph = self.build_variable_causal_graph(graph)
+
         # Get causal parents of target
         causal = self.find_causal_parents(target_node, graph)
         causal_vars = {c["factor"] for c in causal if c["is_causal"]}
 
-        # For each causal variable, trace upstream
+        # Find the BRANCH node and its condition variable
+        target_instr = self.ir.get(target_node)
+        if not target_instr or target_instr.op != "BRANCH":
+            return {"DECISION CAUSE": [], "UPSTREAM CAUSE": [], "CONTEXT": []}
+
+        branch_condition_var = target_instr.args[0]  # The condition variable
+
         decision_causes = []
         upstream_causes = []
-        context_vars = []
 
         for c in causal:
             var = c["factor"]
-            # Check if this variable is written at a node that the target dominates
             defs = self._get_reaching_defs(var, target_node)
             if not defs:
-                context_vars.append(var)
                 continue
 
             def_node = defs[0]
-            # If def_node is directly before target, it's decision cause
-            instr = self.ir.get(def_node)
-            if instr and instr.op in ("EQ", "CMP", "MOV"):
-                # Check if it's a comparison result
-                if var in ("R_flag",):
-                    decision_causes.append({
-                        "var": var,
-                        "def_node": def_node,
-                        "value": c["original_value"]
-                    })
-                else:
-                    # Check if it feeds into decision cause
-                    if def_node in self._get_upstream_nodes("R_flag"):
-                        upstream_causes.append({
-                            "var": var,
-                            "def_node": def_node,
-                            "value": c["original_value"],
-                            "feeds_into": "R_flag"
-                        })
-                    else:
-                        decision_causes.append({
-                            "var": var,
-                            "def_node": def_node,
-                            "value": c["original_value"]
-                        })
-            else:
+
+            # Decision cause: variable that directly controls the branch
+            if var == branch_condition_var:
+                decision_causes.append({
+                    "var": var,
+                    "def_node": def_node,
+                    "value": c["original_value"],
+                    "reason": f"directly controls BRANCH at {target_node}"
+                })
+            # Check if this variable feeds into the branch condition
+            elif var in var_graph and branch_condition_var in var_graph.get(var, []):
                 upstream_causes.append({
                     "var": var,
                     "def_node": def_node,
-                    "value": c["original_value"]
+                    "value": c["original_value"],
+                    "feeds_into": branch_condition_var,
+                    "reason": f"upstream of {branch_condition_var}"
+                })
+            else:
+                # Causal but not decision or upstream - classify as upstream
+                upstream_causes.append({
+                    "var": var,
+                    "def_node": def_node,
+                    "value": c["original_value"],
+                    "reason": "affects outcome"
                 })
 
         # Context: variables that are read but not causal
-        target_instr = self.ir.get(target_node)
+        context_vars = []
         if target_instr:
             for var in target_instr.reads:
-                if var not in causal_vars and var not in [d["var"] for d in decision_causes] and var not in [u["var"] for u in upstream_causes]:
-                    context_vars.append(var)
+                if var not in causal_vars:
+                    context_vars.append({"var": var, "reason": "no effect on outcome"})
 
         return {
             "DECISION CAUSE": decision_causes,
             "UPSTREAM CAUSE": upstream_causes,
-            "CONTEXT": [{"var": v} for v in context_vars]
+            "CONTEXT": context_vars
         }
 
     def _get_upstream_nodes(self, target_var: str) -> Set[str]:
@@ -1323,12 +1436,16 @@ class SemanticResolver:
         """
         Explain why a particular outcome did NOT occur.
 
-        e.g., "Why not REST AND FLUIDS?"
+        Uses goal-directed causal search:
+        1. Find minimal interventions that achieve alternative_outcome
+        2. Compare with current state to identify blocking factors
 
         Output: {
-            "target_outcome": "REST AND FLUIDS",
-            "blocking_factors": [{"var": "R_flag", "value": True, "reason": "..."}],
-            "required_change": "R_flag=False"
+            "current_outcome": str,
+            "target_outcome": str,
+            "blocking_factors": [...],
+            "required_change": {...},
+            "explanation": str
         }
         """
         # Get current outcome
@@ -1337,46 +1454,316 @@ class SemanticResolver:
         ctx = graph.run(engine, ctx)
         current_outcome = ctx.regs.get("R_out", "")
 
-        # To get alternative_outcome, what needs to change?
-        # We know from causal analysis that R_flag controls this
-        causal = self.find_causal_parents("n4", graph)
+        # If already at target, nothing to explain
+        if current_outcome == alternative_outcome:
+            return {
+                "current_outcome": current_outcome,
+                "target_outcome": alternative_outcome,
+                "blocking_factors": [],
+                "required_change": {},
+                "explanation": f"Already at target outcome: {alternative_outcome}"
+            }
 
-        # For REST AND FLUIDS outcome, need R_flag=False
-        # For CALL 911 outcome, need R_flag=True
+        # Use find_minimal_causal_sets to find interventions that achieve target
+        all_sets = self.find_minimal_causal_sets("n4", graph)
 
+        # Find which intervention achieves the desired outcome
+        achieving_intervention = None
+        for ms in all_sets.get("minimal_sets", []):
+            # Use substring match for outcome comparison
+            if alternative_outcome.upper() in ms["outcome"].upper() or ms["outcome"].upper() in alternative_outcome.upper():
+                achieving_intervention = ms["vars"]
+                break
+
+        if not achieving_intervention:
+            return {
+                "current_outcome": current_outcome,
+                "target_outcome": alternative_outcome,
+                "blocking_factors": [],
+                "required_change": {},
+                "explanation": f"No intervention found to achieve {alternative_outcome}"
+            }
+
+        # Identify blocking factors: what differs between current and required
         blocking = []
-        required = None
+        for var, target_val in achieving_intervention.items():
+            # Find current value from causal analysis
+            causal = self.find_causal_parents("n4", graph)
+            for c in causal:
+                if c["factor"] == var:
+                    current_val = c["original_value"]
+                    if current_val != target_val:
+                        blocking.append({
+                            "var": var,
+                            "current_value": current_val,
+                            "required_value": target_val,
+                            "blocks": alternative_outcome,
+                            "reason": f"{var}={current_val} prevents reaching {alternative_outcome}"
+                        })
 
-        if "REST" in alternative_outcome.upper() and "911" in current_outcome.upper():
-            # Currently at CALL 911, want REST - need R_flag=False
-            for c in causal:
-                if c["factor"] == "R_flag" and c["original_value"] == True:
-                    blocking.append({
-                        "var": "R_flag",
-                        "current_value": True,
-                        "blocks": alternative_outcome,
-                        "reason": "R_flag=True causes branch to n5b (CALL 911)"
-                    })
-                    required = {"R_flag": False}
-        elif "911" in alternative_outcome.upper() and "REST" in current_outcome.upper():
-            # Currently at REST, want CALL 911 - need R_flag=True
-            for c in causal:
-                if c["factor"] == "R_flag" and c["original_value"] == False:
-                    blocking.append({
-                        "var": "R_flag",
-                        "current_value": False,
-                        "blocks": alternative_outcome,
-                        "reason": "R_flag=False causes branch to n5a (REST AND FLUIDS)"
-                    })
-                    required = {"R_flag": True}
+        # Build required change dict
+        required = {var: target_val for var, target_val in achieving_intervention.items()}
+
+        # Find what would need to flip (for explanation)
+        flips_needed = []
+        for b in blocking:
+            if isinstance(b["current_value"], bool):
+                flips_needed.append(f"{b['var']}={not b['current_value']}")
+            else:
+                flips_needed.append(f"{b['var']}={b['required_value']}")
+
+        explanation = f"System prevented {alternative_outcome} because "
+        if flips_needed:
+            explanation += " + ".join(flips_needed)
+        else:
+            explanation += "no valid intervention found"
 
         return {
             "current_outcome": current_outcome,
             "target_outcome": alternative_outcome,
             "blocking_factors": blocking,
             "required_change": required,
-            "explanation": f"System blocked {alternative_outcome} because {' + '.join(b['var'] + '=' + str(b['current_value']) for b in blocking)}"
+            "explanation": explanation
         }
+
+    def intervene(self, graph: "ExecutionGraph", assignments: Dict[str, Any], at_node: str = None):
+        """
+        Perform an intervention using do(X=x) semantics.
+
+        Uses ExecutionEngine with clamped variables.
+        For true SCM semantics, do(X=x) replaces the equation F_X.
+
+        Returns: (graph, result_regs dict)
+        """
+        engine = ExecutionEngine(self)
+        ctx = VMContext()
+        ctx.exogenous = {}
+
+        # Populate exogenous
+        for node_id, instr in graph.nodes.items():
+            if instr.op == "CALL" and instr.args:
+                dest = instr.args[3] if len(instr.args) > 3 else None
+                if dest and dest not in ctx.exogenous:
+                    ctx.exogenous[f"call_{dest}"] = f"CALL({instr.args[1] if len(instr.args) > 1 else 'diagnose'})"
+
+        # Apply do(X=x) intervention
+        for var, val in assignments.items():
+            ctx.clamped[var] = val
+            ctx.regs[var] = val
+
+        ctx = graph.run(engine, ctx)
+
+        return graph, ctx.regs
+
+    def counterfactual_equivalence_classes(self, graph: "ExecutionGraph") -> Dict[str, List[Dict]]:
+        """
+        Find all intervention equivalence classes.
+
+        Equivalence class = set of interventions that lead to the same outcome.
+
+        Output: {
+            "EMERGENCY PROTOCOL: CALL 911": [
+                {"vars": {"R_flag": True}, "size": 1},
+                {"vars": {"R_result": "CASE_CRITICAL"}, "size": 1},
+            ],
+            "REST AND FLUIDS": [...]
+        }
+        """
+        target_instr = self.ir.get("n4")
+        if not target_instr:
+            return {}
+
+        test_vars = []
+        if target_instr.op == "BRANCH" and target_instr.args:
+            test_vars.append(target_instr.args[0])
+        else:
+            test_vars = list(target_instr.reads)
+
+        domains = {}
+        for v in test_vars:
+            if v == "R_flag":
+                domains[v] = [False, True]
+            elif v == "R_result":
+                domains[v] = ["CASE_NORMAL", "CASE_CRITICAL"]
+
+        if not domains:
+            return {}
+
+        # Baseline
+        engine = ExecutionEngine(self)
+        ctx_base = VMContext()
+        ctx_base = graph.run(engine, ctx_base)
+        baseline = ctx_base.regs.get("R_out", "")
+
+        # Collect all single interventions
+        outcome_groups = {}  # outcome -> list of interventions
+
+        for var in test_vars:
+            if var not in domains:
+                continue
+            for alt_val in domains[var]:
+                patched_graph, result = self.intervene(graph, {var: alt_val})
+                if isinstance(result, dict):
+                    outcome = result.get("R_out", "")
+                else:
+                    outcome = result.regs.get("R_out", "")
+                if outcome not in outcome_groups:
+                    outcome_groups[outcome] = []
+                outcome_groups[outcome].append({
+                    "vars": {var: alt_val},
+                    "size": 1,
+                    "is_baseline": (outcome == baseline and var == "R_flag" and alt_val == False)
+                })
+
+        return outcome_groups
+
+    def extract_world(self, ctx) -> Dict[str, Any]:
+        """
+        Extract the latent world state (exogenous variables) from a context.
+
+        This captures all non-deterministic choices that affect execution.
+        Used to ensure counterfactuals are computed in the SAME world.
+
+        Returns: dict of exogenous values
+        """
+        return ctx.exogenous.copy() if ctx.exogenous else {}
+
+    def counterfactual(self, graph: "ExecutionGraph", target_node: str, do_assignments: Dict[str, Any]) -> Dict:
+        """
+        Compute Y_do(X=x)(u) using TRUE Structural Equation semantics.
+
+        Method:
+        - Factual: Use ExecutionEngine for correct control flow + record exogenous
+        - Counterfactual: Use SES-style equation replacement (same U)
+
+        The key insight: do(X=x) replaces the equation F_X, so we:
+        1. Record exogenous U from factual run
+        2. For counterfactual, apply interventions BEFORE evaluation (SES style)
+        3. Use same U to ensure counterfactual consistency
+
+        This is the Pearl-compliant counterfactual: Y_do(X=x)(u)
+        """
+        # Extract target variable from target_node
+        target_instr = graph.nodes.get(target_node)
+        target_var = None
+        if target_instr and target_instr.writes:
+            target_var = list(target_instr.writes)[0]
+
+        # Factual: use ExecutionEngine for correct semantics
+        engine = ExecutionEngine(self)
+
+        ctx_factual = VMContext()
+        ctx_factual.exogenous = {}
+
+        # Populate exogenous from factual run
+        ctx_factual = graph.run(engine, ctx_factual)
+        factual_value = ctx_factual.regs.get(target_var, ctx_factual.regs.get("R_out", ""))
+
+        # Counterfactual: apply do(X=x) intervention using SES semantics
+        # do(X=x) = replace equation F_X with constant x
+        # We do this by pre-populating clamped vars and re-running
+        ctx_cf = VMContext()
+        ctx_cf.exogenous = ctx_factual.exogenous.copy()  # SAME world u!
+
+        # Apply do() as equation replacement
+        for var, val in do_assignments.items():
+            ctx_cf.clamped[var] = val
+            ctx_cf.regs[var] = val
+
+        ctx_cf = graph.run(engine, ctx_cf)
+        cf_value = ctx_cf.regs.get(target_var, ctx_cf.regs.get("R_out", ""))
+
+        return {
+            "factual": factual_value,
+            "counterfactual": cf_value,
+            "target_var": target_var,
+            "do_intervention": do_assignments,
+            "exogenous": ctx_factual.exogenous.copy(),
+            "changed": factual_value != cf_value,
+            "method": "structural_equation_replacement"
+        }
+
+    def export_scm(self, graph: "ExecutionGraph") -> Dict[str, Any]:
+        """
+        Export the execution graph as a Structural Causal Model.
+
+        Uses pruned causal graph to get ACTUAL causal parents (not just dataflow reads).
+        An edge X → Y exists iff do(X=x') specifically changes Y.
+
+        Returns: {
+            "variables": [var names],
+            "parents": {var: [causal parent vars]},
+            "equations": {var: "lambda ..."},
+            "causal_graph": {source: [targets]}
+        }
+        """
+        causal_graph = self.prune_causal_graph(graph)
+
+        # Build reverse causal graph: target -> sources
+        causal_parents = {}  # var -> set of causal parent vars
+        for source, targets in causal_graph.items():
+            for target in targets:
+                if target not in causal_parents:
+                    causal_parents[target] = set()
+                causal_parents[target].add(source)
+
+        variables = set()
+        parents = {}  # var -> list of CAUSAL parent vars (not dataflow!)
+        equations = {}  # var -> string representation
+
+        for node_id, instr in self.ir.items():
+            for written in instr.writes:
+                variables.add(written)
+                # Use CAUSAL parents from pruned graph, not dataflow reads
+                parents[written] = sorted(list(causal_parents.get(written, set())))
+
+                # Build equation string
+                if instr.op == "EQ":
+                    equations[written] = f"EQ({instr.args[0]}, {instr.args[1]})"
+                elif instr.op == "MOV":
+                    if len(instr.args) >= 2:
+                        equations[written] = str(instr.args[1])
+                    else:
+                        equations[written] = "?"
+                elif instr.op == "CALL":
+                    equations[written] = f"CALL({instr.args[1]})"
+                elif instr.op == "BRANCH":
+                    equations[written] = f"BRANCH({instr.args[0]})"
+                else:
+                    equations[written] = instr.op
+
+        return {
+            "variables": sorted(list(variables)),
+            "parents": parents,
+            "equations": equations,
+            "causal_graph": {k: sorted(list(v)) for k, v in causal_graph.items() if v}
+        }
+
+    def backward_slice(self, target_node: str) -> Set[str]:
+        """
+        Compute the set of nodes that could affect target_node.
+
+        This is used to limit the search space for minimal causal sets
+        to only relevant variables (not all variables in the program).
+
+        Returns: set of node IDs that are ancestors of target_node in dataflow
+        """
+        relevant = set()
+        queue = [target_node]
+
+        while queue:
+            current = queue.pop(0)
+            if current in relevant:
+                continue
+            relevant.add(current)
+
+            # Find nodes that feed into current
+            for node_id, instr in self.ir.items():
+                if target_node in instr.next or any(t in relevant for t in instr.next):
+                    if node_id not in relevant:
+                        queue.append(node_id)
+
+        return relevant
 
     # ============================================================
     # Internal Helper Methods
@@ -1728,10 +2115,22 @@ class SemanticResolver:
 
 @dataclass
 class VMContext:
+    """
+    VM execution context with world-consistent state.
+
+    Key fields:
+    - regs: current register values
+    - clamped: do-calculus interventions (var -> value)
+    - exogenous: latent world state (u) for counterfactual reasoning
+                   All counterfactuals share the same exogenous values
+    - trace: execution history for debugging
+    """
     pc: Optional[str] = None
     regs: Dict[str, Any] = field(default_factory=dict)
     done: bool = False
     trace: List[Dict] = field(default_factory=list)
+    clamped: Dict[str, Any] = field(default_factory=dict)  # do-calculus: clamped variables
+    exogenous: Dict[str, Any] = field(default_factory=dict)  # Latent context for counterfactuals
 
 
 class ExecutionEngine:
@@ -1759,13 +2158,39 @@ class ExecutionEngine:
         if isinstance(src, str) and src.startswith("@"):
             src = ctx.regs.get(src[1:])
         if dest:
+            # do-calculus: skip write if variable is clamped (intervened)
+            if dest in ctx.clamped:
+                return src
             ctx.regs[dest] = src
         return src
 
     def _call(self, instr: Instr, ctx: VMContext):
+        """
+        Execute CALL instruction with exogenous tracking.
+
+        CALL represents external non-determinism (tools, agents, noise).
+        We record the result in exogenous to enable counterfactual reasoning:
+        - Same exogenous → same external call results
+        - This captures the latent world state U
+        """
         dest = instr.args[3] if len(instr.args) > 3 else None
-        result = f"CALL({instr.args[1] if len(instr.args) > 1 else '?'})"
+        tool_name = instr.args[1] if len(instr.args) > 1 else "unknown"
+
+        # Generate result - this represents external non-determinism
+        # In a real system, this would be the actual tool/agent response
+        result = f"CALL({tool_name})"
+
+        # Record in exogenous to capture latent world state
+        # This is how we bind the external non-determinism to U
+        if dest and dest not in ctx.exogenous:
+            # Store the external call result in exogenous
+            # This binds the "randomness" to the world state U
+            ctx.exogenous[f"call_{dest}"] = result
+
         if dest:
+            # do-calculus: skip write if variable is clamped
+            if dest in ctx.clamped:
+                return result
             ctx.regs[dest] = result
         return result
 
@@ -1775,6 +2200,9 @@ class ExecutionEngine:
         right = instr.args[1] if len(instr.args) > 1 else None
         result = (left == right)
         if dest:
+            # do-calculus: skip write if variable is clamped
+            if dest in ctx.clamped:
+                return result
             ctx.regs[dest] = result
         return result
 
@@ -1800,6 +2228,599 @@ class ExecutionEngine:
             ctx.pc = instr.next[0] if instr.next else None
             return ctx.pc
         return None
+
+
+# ============================================================
+# Structural Equation System (True SCM Semantics)
+# ============================================================
+
+class SSABuilder:
+    """
+    SSA (Static Single Assignment) builder for structural equations.
+
+    Transforms CFG with branching into versioned variables with phi nodes at merge points.
+
+    BEFORE (Execution model):
+        if cond: Y = A
+        else:   Y = B
+        → path selection = control semantics
+
+    AFTER (SCM model):
+        Y_1 = A
+        Y_2 = B
+        Y_3 = φ(Y_1, Y_2, cond)
+        → Y = F_Y(parents, U) = cond ? A : B
+    """
+
+    def __init__(self, graph: "ExecutionGraph"):
+        self.graph = graph
+        self.cfg = graph.cfg
+        self.next_version: Dict[str, int] = {}
+        self.phi_nodes: Dict[str, str] = {}  # merge_point -> phi_var
+        self.var_versions: Dict[str, Dict[str, str]] = {}  # original_var -> node_id -> versioned_var
+
+    def build(self) -> Dict[str, "Equation"]:
+        """
+        Build SSA-based structural equations.
+
+        Returns: {versioned_var: Equation}
+        Each Equation contains: F_Y = lambda(parent_values, U) -> Y_value
+        """
+        # Step 1: Identify merge points (nodes with >1 predecessor)
+        merge_points = self._find_merge_points()
+
+        # Step 2: For each merge point, insert phi node
+        for mp in merge_points:
+            self._insert_phi(mp)
+
+        # Step 3: Build equations for all versioned variables
+        equations = {}
+        for orig_var, versions in self.var_versions.items():
+            for node_id, versioned_var in versions.items():
+                instr = self.graph.nodes.get(node_id)
+                if instr:
+                    eq = self._build_eq_for_instr(instr, versioned_var)
+                    if eq:
+                        equations[versioned_var] = eq
+
+        return equations
+
+    def _find_merge_points(self) -> List[str]:
+        """Find all CFG nodes that are merge points (>1 predecessor)."""
+        merge_points = []
+        for node_id, block in self.cfg.blocks.items():
+            if len(block.predecessors) > 1:
+                merge_points.append(node_id)
+        return merge_points
+
+    def _insert_phi(self, merge_point: str) -> str:
+        """
+        Insert phi node at merge point.
+
+        Creates: phi_var = φ(var_1, var_2, ..., cond)
+        Returns: the phi variable name
+        """
+        block = self.cfg.blocks.get(merge_point)
+        if not block or len(block.predecessors) < 2:
+            return None
+
+        preds = block.predecessors
+
+        # Generate unique phi variable
+        phi_var = f"phi_{merge_point}"
+        self.phi_nodes[merge_point] = phi_var
+
+        # Track all incoming versions from each predecessor
+        incoming_versions = []
+        for pred in preds:
+            # Each predecessor defines a version of variables
+            pred_versions = self._get_versions_at(pred)
+            incoming_versions.append(pred_versions)
+
+        # Create phi function: selects based on condition
+        # We store which original var each version comes from
+        self.var_versions.setdefault(phi_var, {})[merge_point] = phi_var
+
+        return phi_var
+
+    def _get_versions_at(self, node_id: str) -> Dict[str, str]:
+        """Get all variable versions current at a given node."""
+        versions = {}
+        for orig_var, node_map in self.var_versions.items():
+            # Find the latest version before/at node_id
+            for n in self.cfg.blocks.keys():
+                if n == node_id and node_id in node_map:
+                    versions[orig_var] = node_map[node_id]
+        return versions
+
+    def _next_version(self, var: str) -> str:
+        """Get next versioned name for var."""
+        if var not in self.next_version:
+            self.next_version[var] = 0
+        v = self.next_version[var]
+        self.next_version[var] = v + 1
+        return f"{var}_{v}"
+
+    def _build_eq_for_instr(self, instr: "Instr", output_var: str) -> Optional["Equation"]:
+        """Build equation for a single instruction."""
+        op = instr.op
+        args = instr.args
+
+        if op == "MOV":
+            src = args[1] if len(args) > 1 else None
+            if isinstance(src, str) and not src.startswith("@"):
+                # Constant
+                return Equation(output_var, [], lambda p, U, c=src: c)
+            elif isinstance(src, str) and src.startswith("@"):
+                # Copy from parent
+                parent = src[1:]
+                return Equation(output_var, [parent], lambda p, U, s=parent: p[0] if p else U.get(s))
+            else:
+                return None
+
+        elif op == "EQ":
+            left = args[0] if len(args) > 0 else None
+            right = args[1] if len(args) > 1 else None
+            if isinstance(left, str) and left.startswith("@"):
+                left = left[1:]
+            if isinstance(right, str) and right.startswith("@"):
+                right = right[1:]
+            return Equation(output_var, [left, right], lambda p, U: p[0] == p[1] if len(p) >= 2 else False)
+
+        elif op == "CALL":
+            tool = args[1] if len(args) > 1 else "unknown"
+            return Equation(output_var, [], lambda p, U, t=tool: U.get(f"call_{output_var}", f"CALL({t})"))
+
+        elif op == "BRANCH":
+            # BRANCH doesn't define a value directly, but conditions subsequent MOVs
+            return None
+
+        return None
+
+
+@dataclass
+class Equation:
+    """
+    Structural equation F_Y = lambda(parent_values, U) -> Y_value
+
+    In SCM, every variable Y is defined by a structural equation:
+    Y := F_Y(parents, U)
+
+    where:
+    - parents: values of parent variables (direct causes)
+    - U: exogenous (latent) variables
+    """
+    output_var: str
+    parent_vars: List[str]
+    fn: Callable  # lambda(parent_vals, U) -> value
+
+    def evaluate(self, parent_values: List, U: Dict) -> Any:
+        return self.fn(parent_values, U)
+
+    def __repr__(self):
+        return f"F_{self.output_var}({self.parent_vars})"
+
+
+# ============================================================
+# Structural Equation System (True SCM Evaluator)
+# ============================================================
+
+class StructuralEquationSystem:
+    """
+    True Structural Causal Model evaluator.
+
+    Key properties:
+    - Each variable Y has ONE equation F_Y (SSA ensures single definition)
+    - do(X=x) REPLACES F_X with constant x (Pearl semantics)
+    - No execution - pure functional evaluation topologically
+
+    vs ExecutionEngine (approximation):
+    - ExecutionEngine: path selection via control flow
+    - SES: value = F_Y(parents, U) - no paths, only functions
+    """
+
+    def __init__(self, graph: "ExecutionGraph"):
+        self.graph = graph
+        self.equations: Dict[str, Equation] = {}
+        self.branch_conditions: Dict[str, str] = {}  # node_id -> condition var
+        self.build_equations()
+
+    def build_equations(self):
+        """Build structural equations from IR with SSA-style version tracking."""
+        # First pass: identify branch conditions
+        for node_id, instr in self.graph.nodes.items():
+            if instr.op == "BRANCH" and instr.args:
+                cond = instr.args[0]
+                if isinstance(cond, str) and cond.startswith("@"):
+                    cond = cond[1:]
+                self.branch_conditions[node_id] = cond
+
+        # Find merge points (nodes with >1 predecessor)
+        merge_points = set()
+        for node_id, block in self.graph.cfg.blocks.items():
+            if len(block.predecessors) > 1:
+                merge_points.add(node_id)
+
+        # Track all definitions (SSA: each definition is a new version)
+        definitions = {}  # var -> list of (node_id, eq)
+
+        # Process nodes in topological order
+        for node_id in self._topo_order():
+            instr = self.graph.nodes.get(node_id)
+            if not instr:
+                continue
+
+            # Process writes
+            for written in instr.writes:
+                eq = self._build_instr_eq(instr, written, {})
+                if eq:
+                    # Each definition creates a new version
+                    versioned = f"{written}_d{len(definitions.get(written, []))}"
+                    eq.output_var = versioned
+                    if written not in definitions:
+                        definitions[written] = []
+                    definitions[written].append((node_id, eq))
+
+                    # Store equation
+                    self.equations[versioned] = eq
+
+            # At merge point, create phi that joins all definitions
+            if node_id in merge_points:
+                # Get all variables that were defined before this merge
+                for var, defs in definitions.items():
+                    if not defs:
+                        continue
+
+                    # Find the BRANCH that controls this merge point
+                    # The merge point's predecessors should be the direct successors of the BRANCH
+                    branch_node_id = None
+                    branch_cond = None
+
+                    # Get the merge point's predecessors (the two branches)
+                    block = self.graph.cfg.blocks.get(node_id)
+                    if block and len(block.predecessors) >= 2:
+                        # The two predecessors should be n5a and n5b
+                        # Their common predecessor is n4 (the BRANCH)
+                        pred0 = block.predecessors[0]
+                        pred1 = block.predecessors[1]
+                        # Trace back to find common predecessor that is a BRANCH
+                        common = self._find_common_ancestor(pred0, pred1)
+                        if common:
+                            branch_instr = self.graph.nodes.get(common)
+                            if branch_instr and branch_instr.op == "BRANCH":
+                                branch_node_id = common
+                                cond = branch_instr.args[0] if branch_instr.args else None
+                                if isinstance(cond, str) and cond.startswith("@"):
+                                    cond = cond[1:]
+                                branch_cond = cond
+
+                    # Get the two branch values - need to correctly identify which is false/true
+                    # based on BRANCH next[] ordering, not defs order
+                    false_var = None
+                    true_var = None
+
+                    if len(defs) >= 2:
+                        # We need to know which predecessor is false and which is true
+                        # BRANCH next[0] = false target, next[1] = true target
+                        branch_instr = None
+                        if branch_node_id:
+                            branch_instr = self.graph.nodes.get(branch_node_id)
+
+                        if branch_instr and branch_instr.next and len(branch_instr.next) >= 2:
+                            false_target = branch_instr.next[0]  # n5b
+                            true_target = branch_instr.next[1]   # n5a
+
+                            # Find which def corresponds to which branch
+                            for pred_node, eq in defs:
+                                if pred_node == false_target:
+                                    false_var = eq.output_var
+                                elif pred_node == true_target:
+                                    true_var = eq.output_var
+
+                        # Fallback: use order
+                        if false_var is None or true_var is None:
+                            false_var = defs[-2][1].output_var
+                            true_var = defs[-1][1].output_var
+                    elif len(defs) == 1:
+                        false_var = defs[0][1].output_var
+                        true_var = defs[0][1].output_var
+                    else:
+                        continue
+
+                    # Find the versioned variable for the condition (R_flag)
+                    # The condition var is an EXPLICIT causal parent of phi
+                    cond_var = branch_cond  # e.g., "R_flag"
+                    # Find versioned cond var (e.g., "R_flag_d0")
+                    cond_versioned = None
+                    for eq_var, eq in self.equations.items():
+                        if eq.output_var.startswith(cond_var):
+                            cond_versioned = eq_var
+                            break
+                    if not cond_versioned:
+                        cond_versioned = cond_var
+
+                    phi_var = f"phi_{node_id}_{var}"
+                    phi_eq = Equation(
+                        output_var=phi_var,
+                        parent_vars=[false_var, true_var, cond_versioned],  # explicit causal parent!
+                        fn=self._make_phi_fn(cond_var, true_var, false_var)
+                    )
+                    self.equations[phi_var] = phi_eq
+
+    def _find_common_ancestor(self, node_a: str, node_b: str) -> Optional[str]:
+        """Find common ancestor of two nodes by tracing predecessors."""
+        ancestors_a = set()
+        current = node_a
+        while current:
+            ancestors_a.add(current)
+            block = self.graph.cfg.blocks.get(current)
+            if block and block.predecessors:
+                current = block.predecessors[0]  # Take first predecessor
+            else:
+                current = None
+
+        # Find common ancestor
+        current = node_b
+        while current:
+            if current in ancestors_a:
+                return current
+            block = self.graph.cfg.blocks.get(current)
+            if block and block.predecessors:
+                current = block.predecessors[0]
+            else:
+                current = None
+        return None
+
+    def _topo_order(self) -> List[str]:
+        """Get nodes in topological order (forward CFG traversal)."""
+        visited = set()
+        order = []
+
+        def visit(node_id):
+            if node_id in visited or node_id not in self.graph.nodes:
+                return
+            visited.add(node_id)
+            instr = self.graph.nodes[node_id]
+            # Visit all successors
+            for succ in instr.next:
+                visit(succ)
+            # Add AFTER visiting successors (post-order)
+            order.append(node_id)
+
+        visit(self.graph.root)
+        # Reverse to get forward order (predecessors before successors)
+        order.reverse()
+        return order
+
+    def _make_phi_fn(self, condition_var: str, true_var: str, false_var: str):
+        """
+        Create phi function with EXPLICIT causal parent (condition_var).
+
+        BEFORE (U-lookup - not true SCM):
+            cond_val = U.get(cond_var)  # hidden dependency
+            return true_val if cond_val else false_val
+
+        AFTER (explicit causal parent - true SCM):
+            phi_fn receives condition as explicit parent argument
+            phi = lambda R0, R1, R_flag: R_flag ? R1 : R0
+
+        This is the key SCM property:
+        - All causality must be explicit in the parent graph
+        - No hidden "control flow as external lookup"
+        """
+        cv = condition_var
+
+        def phi_fn(parent_vals, U):
+            if len(parent_vals) < 3:
+                return parent_vals[0] if parent_vals else None
+
+            false_val, true_val, cond_val = parent_vals[0], parent_vals[1], parent_vals[2]
+            return true_val if cond_val else false_val
+
+        return phi_fn
+
+    def _build_instr_eq(self, instr: "Instr", output_var: str, versions: Dict[str, str]) -> Optional[Equation]:
+        """Build equation for a single instruction."""
+        op = instr.op
+        args = instr.args
+
+        if op == "MOV":
+            src = args[1] if len(args) > 1 else None
+            if isinstance(src, str) and not src.startswith("@"):
+                # Constant assignment
+                const = src
+                return Equation(output_var, [], lambda p, U, c=const: c)
+            elif isinstance(src, str) and src.startswith("@"):
+                # Copy from parent (dereference @)
+                parent = src[1:]
+                return Equation(output_var, [parent], lambda p, U, s=parent: U.get(s) or p[0])
+            else:
+                return None
+
+        elif op == "EQ":
+            left = args[0] if len(args) > 0 else None
+            right = args[1] if len(args) > 1 else None
+            # Dereference @ prefix
+            if isinstance(left, str) and left.startswith("@"):
+                left = left[1:]
+            if isinstance(right, str) and right.startswith("@"):
+                right = right[1:]
+            # Only add VARIABLE references as parents (not constant literals)
+            parent_vars = []
+            if left and not left.startswith("CASE_") and left not in ("TRUE", "FALSE", "True", "False"):
+                parent_vars.append(left)
+            if right and not right.startswith("CASE_") and right not in ("TRUE", "FALSE", "True", "False"):
+                parent_vars.append(right)
+            # Compare actual values: left_val == right_val
+            def eq_fn(p, U, l=left, r=right):
+                left_val = p[0] if len(p) > 0 else l
+                right_val = p[1] if len(p) > 1 else r
+                return left_val == right_val
+            return Equation(output_var, parent_vars, eq_fn)
+
+        elif op == "CALL":
+            tool = args[1] if len(args) > 1 else "unknown"
+            return Equation(output_var, [], lambda p, U, t=tool: U.get(f"call_{output_var}", f"CALL({t})"))
+
+        elif op == "BRANCH":
+            # BRANCH doesn't define a value, but we record the condition
+            cond_var = args[0] if args else None
+            if isinstance(cond_var, str) and cond_var.startswith("@"):
+                cond_var = cond_var[1:]
+            self.branch_conditions[instr.id] = cond_var
+            return None
+
+        return None
+
+    def _build_phi_eq(self, phi_var: str, block: "BasicBlock", versions: Dict[str, str]) -> Optional[Equation]:
+        """
+        Build phi equation at merge point.
+
+        Phi selects from incoming values based on branch condition.
+
+        F_phi = λ parents, U: cond ? val_true : val_false
+        """
+        if len(block.predecessors) < 2:
+            return None
+
+        preds = block.predecessors
+
+        # Find the branch that controls this merge
+        branch_cond = None
+        for pred in preds:
+            pred_instr = self.graph.nodes.get(pred)
+            if pred_instr and pred_instr.op == "BRANCH":
+                cond = pred_instr.args[0] if pred_instr.args else None
+                if isinstance(cond, str) and cond.startswith("@"):
+                    cond = cond[1:]
+                branch_cond = cond
+                break
+
+        if not branch_cond:
+            return None
+
+        # Get incoming values from each predecessor
+        # In true SSA, phi takes one arg per predecessor
+        incoming_vars = [f"in_{i}" for i in range(len(preds))]
+
+        # Phi function: cond ? true_val : false_val
+        def phi_fn(p, U, cond=branch_cond, preds=preds):
+            # p[0] = false branch value, p[1] = true branch value
+            # Branch condition determines which path was taken
+            # For counterfactual, we need to evaluate both and select
+            if len(p) >= 2:
+                # Simplified: just return based on condition value in U
+                cond_val = U.get(cond, False)
+                return cond_val and p[1] or p[0]
+            return None
+
+        return Equation(phi_var, incoming_vars, phi_fn)
+
+    def evaluate(self, U: Dict, interventions: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Evaluate all equations topologically.
+
+        For each variable Y:
+        - If do(Y=y): Y = y (equation REPLACED with constant)
+        - Else: Y = F_Y(parents, U)
+
+        This is PURE FUNCTIONAL evaluation - no execution, no control flow.
+        """
+        interventions = interventions or {}
+        results = {}
+
+        # Topological sort
+        order = self._topo_sort()
+
+        for var in order:
+            if var in interventions:
+                # do(X=x): REPLACE equation with constant
+                results[var] = interventions[var]
+            elif var in self.equations:
+                eq = self.equations[var]
+                parent_vals = [results.get(p) for p in eq.parent_vars]
+                results[var] = eq.evaluate(parent_vals, U)
+
+        return results
+
+    def _topo_sort(self) -> List[str]:
+        """Topological sort of variables based on causal dependencies."""
+        visited = set()
+        order = []
+
+        def visit(var):
+            if var in visited:
+                return
+            visited.add(var)
+            if var in self.equations:
+                for parent in self.equations[var].parent_vars:
+                    visit(parent)
+            order.append(var)
+
+        for var in self.equations:
+            visit(var)
+
+        return order
+
+    def do_intervene(self, interventions: Dict[str, Any]) -> "StructuralEquationSystem":
+        """
+        Create new SES with do(X=x) applied.
+
+        do(X=x) = REPLACE F_X with constant x
+        This also updates U so that phi functions see the intervened value.
+
+        Returns: (new_ses, modified_U)
+        """
+        new_ses = StructuralEquationSystem(self.graph)
+        new_ses.equations = dict(self.equations)
+        new_ses.branch_conditions = dict(self.branch_conditions)
+
+        # Replace equations for intervened variables
+        for var, val in interventions.items():
+            # Find equation for this variable and replace with constant
+            for eq_var, eq in new_ses.equations.items():
+                # Match by base variable name (e.g., "R_flag_d0" matches "R_flag")
+                base_name = eq_var.split('_d')[0] if '_d' in eq_var else eq_var
+                if base_name == var:
+                    # Replace with constant equation
+                    new_ses.equations[eq_var] = Equation(
+                        output_var=eq_var,  # Keep versioned name
+                        parent_vars=[],
+                        fn=lambda p, U, v=val: v
+                    )
+                    break
+
+        return new_ses
+
+    def counterfactual(self, U: Dict, do_assignments: Dict[str, Any], target_var: str) -> Dict[str, Any]:
+        """
+        Compute Y_do(X=x)(u) - true counterfactual with same U.
+
+        Method:
+        1. Evaluate factual: Y = F_Y(parents, U)
+        2. Apply do(X=x): F_X replaced with x, U updated with intervened values
+        3. Re-evaluate with same U (modified by intervention)
+
+        This is the Pearl-compliant counterfactual.
+        """
+        # Factual
+        factual = self.evaluate(U, {})
+
+        # Counterfactual with do() applied
+        # Update U with intervened values so phi functions see them
+        U_cf = dict(U)
+        U_cf.update(do_assignments)
+
+        cf_ses = self.do_intervene(do_assignments)
+        counterfactual = cf_ses.evaluate(U_cf, {})
+
+        return {
+            "factual": factual.get(target_var, factual.get("R_out")),
+            "counterfactual": counterfactual.get(target_var, counterfactual.get("R_out")),
+            "exogenous": U,
+            "interventions": do_assignments,
+            "changed": factual != counterfactual
+        }
 
 
 # ============================================================
@@ -1913,6 +2934,388 @@ class ExecutionGraph:
             if "next" in patch: target.next = patch["next"]
 
         return new_graph
+
+
+# ============================================================
+# v1.1 Agent-SCM Interface Layer
+# Transforms internal SCM IR → Agent-native debugging interface
+# ============================================================
+
+@dataclass
+class ToolDecision:
+    """Represents a tool selection decision at a merge point."""
+    node_id: str
+    condition_var: str
+    true_tool: str  # tool selected when condition=True
+    false_tool: str  # tool selected when condition=False
+    selected_tool: str  # actual tool that was chosen
+    outcome: Any  # output of the selected tool
+
+
+@dataclass
+class AgentOverride:
+    """Represents a policy override (behavioral intervention)."""
+    target_node: str
+    override_type: str  # "force_tool" | "skip_tool" | "force_branch"
+    value: Any
+    description: str
+
+
+class AgentIR:
+    """
+    Agent-native interface on top of SCM.
+
+    Transforms:
+        phi_n6_R_out, R_flag_d0, do(R_flag=True)
+    Into:
+        tool_choice_merge(output=R_out), condition=severity_check, override_tool(node=6, tool="emergency")
+
+    API Surface:
+        agent.why(node_id)         → why was this decision made?
+        agent.what_if(node_id, override) → what if we forced different behavior?
+        agent.blame(output_var)   → which decision caused this output?
+    """
+
+    def __init__(self, graph: ExecutionGraph):
+        self.graph = graph
+        self.ses = StructuralEquationSystem(graph)
+        self._build_tool_map()  # Map phi-nodes to tool decisions
+
+    def _build_tool_map(self):
+        """Map phi-nodes to tool decisions based on branch structure."""
+        self.tool_decisions = {}  # node_id -> ToolDecision
+        self.phi_to_branch = {}   # phi_var -> controlling branch node
+        self.tool_semantics = {}  # phi_var -> human-readable description
+
+        # First, find all branches and their controlled merge points
+        branch_to_merge = {}  # branch_node -> list of merge points it controls
+        for node_id, block in self.graph.cfg.blocks.items():
+            if len(block.predecessors) > 1:
+                # This is a merge point - find which branch controls it
+                preds = block.predecessors
+                # Find common ancestor that is a BRANCH
+                common = self._find_common_branchAncestor(preds[0], preds[1])
+                if common:
+                    if common not in branch_to_merge:
+                        branch_to_merge[common] = []
+                    branch_to_merge[common].append(node_id)
+
+        # Build tool decisions for each phi-node
+        for var, eq in self.ses.equations.items():
+            if var.startswith("phi_"):
+                # Parse phi_n6_R_out → node_id=n6, var=R_out
+                parts = var.split("_")
+                if len(parts) >= 3 and parts[0] == "phi":
+                    merge_node = parts[1]
+                    var_name = "_".join(parts[2:])
+
+                    # Find which branch controls this merge
+                    branch_node = None
+                    for bn, merges in branch_to_merge.items():
+                        if merge_node in merges:
+                            branch_node = bn
+                            break
+
+                    # Get condition variable
+                    cond_var = self.ses.branch_conditions.get(branch_node, "unknown")
+
+                    # Get the two possible tools (output values from MOV instructions at branch targets)
+                    true_tool = None
+                    false_tool = None
+                    if branch_node:
+                        branch_instr = self.graph.nodes.get(branch_node)
+                        if branch_instr and branch_instr.next:
+                            # branch.next[0] = false target, [1] = true target
+                            if len(branch_instr.next) >= 1:
+                                false_block = self.graph.nodes.get(branch_instr.next[0])
+                                if false_block:
+                                    # Get the MOV instruction's output value
+                                    mov = self.graph.nodes.get(branch_instr.next[0])
+                                    if mov and mov.op == "MOV" and len(mov.args) >= 2:
+                                        false_tool = mov.args[1]  # The actual output value
+                            if len(branch_instr.next) >= 2:
+                                true_block = self.graph.nodes.get(branch_instr.next[1])
+                                if true_block:
+                                    mov = self.graph.nodes.get(branch_instr.next[1])
+                                    if mov and mov.op == "MOV" and len(mov.args) >= 2:
+                                        true_tool = mov.args[1]  # The actual output value
+
+                    # Determine selected tool based on current evaluation
+                    # The phi equation's parent_vars tell us which is true vs false
+                    selected = false_tool
+                    if eq.parent_vars and len(eq.parent_vars) >= 3:
+                        # Third parent is the condition - if it's True, true_tool is selected
+                        # We need to check actual outcome to determine
+                        pass
+
+                    # Store by BRANCH node (not merge node) - the decision happens at branch
+                    self.phi_to_branch[var] = branch_node
+                    self.tool_semantics[var] = f"tool_choice({var_name})"
+
+                    if branch_node:
+                        self.tool_decisions[branch_node] = ToolDecision(
+                            node_id=branch_node,
+                            condition_var=cond_var,
+                            true_tool=true_tool or "emergency_handler",
+                            false_tool=false_tool or "normal_handler",
+                            selected_tool=self._get_selected_tool(var, eq),
+                            outcome=var_name
+                        )
+
+    def _find_common_branchAncestor(self, node_a: str, node_b: str) -> Optional[str]:
+        """Find common BRANCH ancestor of two nodes."""
+        ancestors_a = set()
+        current = node_a
+        while current:
+            ancestors_a.add(current)
+            block = self.graph.cfg.blocks.get(current)
+            if block and block.predecessors:
+                current = block.predecessors[0]
+            else:
+                current = None
+
+        current = node_b
+        while current:
+            if current in ancestors_a:
+                # Check if this node is a BRANCH
+                instr = self.graph.nodes.get(current)
+                if instr and instr.op == "BRANCH":
+                    return current
+                # Keep going up to find BRANCH ancestor
+            block = self.graph.cfg.blocks.get(current)
+            if block and block.predecessors:
+                current = block.predecessors[0]
+            else:
+                current = None
+        return None
+
+    def _get_selected_tool(self, phi_var: str, eq) -> str:
+        """Determine which tool is currently selected."""
+        # Get the true/false tools from branch
+        branch_node = self.phi_to_branch.get(phi_var)
+        if not branch_node:
+            return "unknown"
+
+        branch_instr = self.graph.nodes.get(branch_node)
+        if not branch_instr or not branch_instr.next:
+            return "unknown"
+
+        # Default to false tool
+        if len(branch_instr.next) >= 1:
+            false_block = self.graph.nodes.get(branch_instr.next[0])
+            if false_block and false_block.writes:
+                return list(false_block.writes)[0]
+        return "unknown"
+
+    def _get_condition_description(self, cond_var: str) -> str:
+        """Convert internal variable name to agent-readable description."""
+        # Map internal names to semantic descriptions
+        semantic_map = {
+            "R_flag": "severity_check",
+            "severity": "severity_level",
+            "critical": "critical_detection",
+            "tool_selected": "tool_selection",
+        }
+        return semantic_map.get(cond_var, cond_var)
+
+    def why(self, node_id: str) -> Dict[str, Any]:
+        """
+        Question: Why was this decision node triggered?
+
+        Returns: explanation of what caused this decision point
+        """
+        if node_id not in self.tool_decisions:
+            return {"error": f"No decision found at node {node_id}"}
+
+        decision = self.tool_decisions[node_id]
+        cond_desc = self._get_condition_description(decision.condition_var)
+        actual_selected = self._get_actual_selected_tool(node_id, decision)
+
+        return {
+            "node": node_id,
+            "type": "tool_selection_decision",
+            "condition": decision.condition_var,
+            "condition_description": cond_desc,
+            "options": {
+                "when_true": decision.true_tool,
+                "when_false": decision.false_tool
+            },
+            "selected": actual_selected,
+            "explanation": f"Decision at node {node_id} selects {actual_selected} because {cond_desc}={self._get_condition_value(node_id)}"
+        }
+
+    def _get_condition_value(self, node_id: str) -> Any:
+        """Get the actual boolean value of the condition at this node."""
+        U = self._build_exogenous_U()
+        result = self.ses.evaluate(U, {})
+        decision = self.tool_decisions.get(node_id)
+        if not decision:
+            return "unknown"
+        phi_var = self._find_phi_for_branch(node_id, decision.outcome)
+        eq = self.ses.equations.get(phi_var)
+        if eq and len(eq.parent_vars) >= 3:
+            return result.get(eq.parent_vars[2])
+        return "unknown"
+
+    def what_if(self, node_id: str, override: AgentOverride) -> Dict[str, Any]:
+        """
+        Question: What if we forced a different decision?
+
+        Example:
+            agent.what_if("n4", override=AgentOverride(
+                target_node="n4",
+                override_type="force_branch",
+                value=True,
+                description="force emergency path"
+            ))
+        """
+        if node_id not in self.tool_decisions:
+            return {"error": f"No decision found at node {node_id}"}
+
+        decision = self.tool_decisions[node_id]
+
+        # Map override to intervention
+        if override.override_type == "force_tool":
+            intervention = {decision.condition_var: override.value}
+        elif override.override_type == "force_branch":
+            intervention = {decision.condition_var: override.value}
+        else:
+            intervention = {override.target_node: override.value}
+
+        # Build U with necessary values for factual evaluation
+        U = self._build_exogenous_U()
+
+        # Find the phi variable for this decision - need to find merge node
+        phi_var = self._find_phi_for_branch(node_id, decision.outcome)
+
+        # Compute factual first
+        factual = self.ses.evaluate(U, {})
+
+        # Compute counterfactual with intervention
+        cf_ses = self.ses.do_intervene(intervention)
+        U_cf = dict(U)
+        U_cf.update(intervention)
+        counterfactual = cf_ses.evaluate(U_cf, {})
+
+        factual_outcome = factual.get(phi_var) if phi_var else None
+        counterfactual_outcome = counterfactual.get(phi_var) if phi_var else None
+
+        return {
+            "original_decision": self._get_actual_selected_tool(node_id, decision),
+            "override_applied": override.description,
+            "factual_outcome": factual_outcome,
+            "counterfactual_outcome": counterfactual_outcome,
+            "changed": factual_outcome != counterfactual_outcome,
+            "intervention": intervention
+        }
+
+    def _find_phi_for_branch(self, branch_node: str, outcome_var: str) -> str:
+        """Find the phi variable that corresponds to a branch node's decision."""
+        for phi_var, bn in self.phi_to_branch.items():
+            if bn == branch_node and outcome_var in phi_var:
+                return phi_var
+        return f"phi_UNKNOWN_{outcome_var}"
+
+    def _build_exogenous_U(self) -> Dict[str, Any]:
+        """Build minimal U for factual evaluation."""
+        U = {}
+        # For each CALL equation, provide a default result
+        for var, eq in self.ses.equations.items():
+            if hasattr(eq, 'fn') and 'call' in str(eq.fn):
+                U[f"call_{var}"] = U.get(f"call_{var}", "CALL(default)")
+        # Provide R_result from CALL
+        U['R_result'] = "CALL(diagnose)"
+        return U
+
+    def blame(self, output_var: str) -> Dict[str, Any]:
+        """
+        Question: Which decision caused this output?
+
+        Traces back from output to the decision nodes that determined it.
+        """
+        # Find all phi-nodes that contribute to this output
+        contributing_decisions = []
+
+        # phi_to_branch maps phi_var -> controlling branch node
+        for phi_var, branch_node in self.phi_to_branch.items():
+            # Check if output_var is part of this phi node's name
+            if output_var in phi_var and branch_node in self.tool_decisions:
+                decision = self.tool_decisions[branch_node]
+                contributing_decisions.append({
+                    "node": branch_node,
+                    "condition": decision.condition_var,
+                    "condition_description": self._get_condition_description(decision.condition_var),
+                    "selected_tool": self._get_actual_selected_tool(branch_node, decision),
+                    "impact": "direct"
+                })
+
+        return {
+            "output": output_var,
+            "contributing_decisions": contributing_decisions,
+            "root_cause": contributing_decisions[0] if contributing_decisions else None
+        }
+
+    def _get_actual_selected_tool(self, node_id: str, decision) -> str:
+        """Determine actual selected tool based on current evaluation."""
+        U = self._build_exogenous_U()
+        phi_var = f"phi_{node_id}_{decision.outcome}"
+
+        # Evaluate to find which branch was taken
+        result = self.ses.evaluate(U, {})
+
+        # The phi node's third parent is the condition
+        eq = self.ses.equations.get(phi_var)
+        if eq and len(eq.parent_vars) >= 3:
+            cond_val = result.get(eq.parent_vars[2], False)
+            return decision.true_tool if cond_val else decision.false_tool
+
+        return decision.false_tool
+
+    def override_tool(self, node_id: str, tool: str) -> AgentOverride:
+        """
+        Convenience method: force specific tool at decision node.
+
+        Example:
+            override = agent.override_tool("n4", tool="EMERGENCY PROTOCOL: CALL 911")
+        """
+        decision = self.tool_decisions.get(node_id)
+        if not decision:
+            return None
+
+        # Map desired tool to condition value
+        # User wants to select a specific tool - we need to figure out what
+        # condition value would cause that tool to be selected
+        if tool == decision.true_tool:
+            # User wants the TRUE branch tool - set condition to True
+            value = True
+        elif tool == decision.false_tool:
+            # User wants the FALSE branch tool - set condition to False
+            value = False
+        else:
+            value = tool
+
+        return AgentOverride(
+            target_node=node_id,
+            override_type="force_tool",
+            value=value,
+            description=f"force tool={tool} at node {node_id}"
+        )
+
+    def explain_full(self) -> str:
+        """Human-readable explanation of the agent's decision graph."""
+        lines = ["=== AGENT DECISION GRAPH ===", ""]
+
+        for node_id, decision in sorted(self.tool_decisions.items()):
+            actual_selected = self._get_actual_selected_tool(node_id, decision)
+            cond_val = self._get_condition_value(node_id)
+            lines.append(f"Node {node_id}: TOOL SELECTION")
+            lines.append(f"  Condition: {self._get_condition_description(decision.condition_var)} ({decision.condition_var}) = {cond_val}")
+            lines.append(f"  When TRUE:  {decision.true_tool}")
+            lines.append(f"  When FALSE: {decision.false_tool}")
+            lines.append(f"  Selected:   {actual_selected}")
+            lines.append("")
+
+        return "\n".join(lines)
 
 
 # ============================================================

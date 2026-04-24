@@ -152,12 +152,12 @@ def cmd_minimal(args):
     print("MINIMAL CAUSAL SET ANALYSIS")
     print("=" * 60)
 
-    result = g.semantic.find_minimal_causal_set("n4", g)
+    result = g.semantic.find_minimal_causal_sets("n4", g)
 
     print(f"\nBaseline outcome: {result['baseline_outcome']}")
-    print(f"Minimal intervention set: {result['minimal_set']}")
+    print(f"Minimal sets: {result['minimal_sets']}")
     print(f"\nAlternative outcomes:")
-    for alt in result["alternatives"]:
+    for alt in result.get("all_alternatives", []):
         print(f"  Flip {list(alt['vars'].keys())[0]}={list(alt['vars'].values())[0]} → {alt['outcome']}")
 
 
@@ -197,14 +197,107 @@ def cmd_classify(args):
     print("\n[DECISION CAUSE]")
     for c in classification["DECISION CAUSE"]:
         print(f"  {c['var']} = {c['value']} (defined at {c['def_node']})")
+        print(f"    Reason: {c['reason']}")
 
     print("\n[UPSTREAM CAUSE]")
     for c in classification["UPSTREAM CAUSE"]:
         print(f"  {c['var']} = {c['value']} (feeds: {c.get('feeds_into', 'N/A')})")
+        print(f"    Reason: {c['reason']}")
 
     print("\n[CONTEXT]")
     for c in classification["CONTEXT"]:
-        print(f"  {c['var']} - no effect on outcome")
+        print(f"  {c['var']} - {c['reason']}")
+
+
+def cmd_intervene(args):
+    """Perform an intervention (do-calculus semantics)."""
+    case = load_case(args.case)
+    query = case.get("query", "")
+    g = run_medical_triage(query)
+
+    print("=" * 60)
+    print("INTERVENTION ANALYSIS (do-calculus)")
+    print("=" * 60)
+
+    # Parse intervention from args or use default
+    if args.var and args.value:
+        assignments = {args.var: args.value}
+    else:
+        assignments = {"R_flag": True}
+
+    print(f"\nIntervention: do({assignments})")
+
+    patched_graph, result = g.semantic.intervene(g, assignments)
+    if isinstance(result, dict):
+        print(f"Result: {result.get('R_out')}")
+    else:
+        print(f"Result: {result.regs.get('R_out')}")
+
+    # Also show equivalence classes
+    print("\n--- EQUIVALENCE CLASSES ---")
+    classes = g.semantic.counterfactual_equivalence_classes(g)
+
+    for outcome, interventions in classes.items():
+        print(f"\n{outcome}:")
+        for iv in interventions:
+            print(f"  {iv['vars']} (size={iv['size']})")
+
+
+def cmd_counterfactual(args):
+    """Compute true counterfactual with same world (u)."""
+    case = load_case(args.case)
+    query = case.get("query", "")
+    g = run_medical_triage(query)
+
+    print("=" * 60)
+    print("COUNTERFACTUAL ANALYSIS (same world)")
+    print("=" * 60)
+
+    # Default intervention
+    if args.var and args.value:
+        do_assignments = {args.var: args.value}
+    else:
+        do_assignments = {"R_flag": True}
+
+    result = g.semantic.counterfactual(g, "n4", do_assignments)
+
+    print(f"\nFactual (actual): {result['factual']}")
+    print(f"Counterfactual: do({do_assignments}) → {result['counterfactual']}")
+    print(f"World (u): {result['exogenous']}")
+    print(f"Changed: {result['changed']}")
+
+    # Also show SCM export
+    print("\n--- SCM EXPORT ---")
+    scm = g.semantic.export_scm(g)
+    print(f"Variables: {scm['variables']}")
+    print(f"Equations: {scm['equations']}")
+    print(f"Causal graph: {scm['causal_graph']}")
+
+
+def cmd_export_scm(args):
+    """Export the graph as Structural Causal Model."""
+    case = load_case(args.case)
+    query = case.get("query", "")
+    g = run_medical_triage(query)
+
+    print("=" * 60)
+    print("STRUCTURAL CAUSAL MODEL EXPORT")
+    print("=" * 60)
+
+    scm = g.semantic.export_scm(g)
+
+    print(f"\nVariables:")
+    for v in scm['variables']:
+        print(f"  - {v}")
+
+    print(f"\nStructural Equations:")
+    for var, eq in scm['equations'].items():
+        print(f"  {var} := {eq}")
+
+    print(f"\nCausal Graph (pruned):")
+    for src, targets in scm['causal_graph'].items():
+        if targets:
+            print(f"  {src} → {targets}")
 
 
 def cmd_fork(args):
@@ -298,6 +391,22 @@ def main():
     classify = sub.add_parser("classify", help="Classify causal variables into tiers")
     classify.add_argument("case", help="Case JSON file")
     classify.set_defaults(func=cmd_classify)
+
+    intervene = sub.add_parser("intervene", help="Perform intervention (do-calculus)")
+    intervene.add_argument("case", help="Case JSON file")
+    intervene.add_argument("--var", help="Variable to intervene on")
+    intervene.add_argument("--value", help="Value to set")
+    intervene.set_defaults(func=cmd_intervene)
+
+    cf = sub.add_parser("counterfactual", help="Compute true counterfactual (same world)")
+    cf.add_argument("case", help="Case JSON file")
+    cf.add_argument("--var", help="Variable to intervene on")
+    cf.add_argument("--value", help="Value to set")
+    cf.set_defaults(func=cmd_counterfactual)
+
+    export = sub.add_parser("export-scm", help="Export as Structural Causal Model")
+    export.add_argument("case", help="Case JSON file")
+    export.set_defaults(func=cmd_export_scm)
 
     run = sub.add_parser("run", help="Run agent with tracing")
     run.add_argument("case", help="Case JSON file")
