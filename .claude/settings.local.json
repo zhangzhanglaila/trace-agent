@@ -29,7 +29,8 @@
       "Bash(python agenttrace.py intervene examples/case_mild_discomfort.json)",
       "Bash(python agenttrace.py counterfactual examples/case_mild_discomfort.json)",
       "Bash(python agenttrace.py export-scm examples/case_mild_discomfort.json)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3 *)"
     ]
   }
 }

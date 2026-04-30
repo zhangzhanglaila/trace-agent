@@ -296,6 +296,37 @@ class Instr:
 
 
 # ============================================================
+# Branch Model (v2.0 - explicit contract for branch structure)
+# ============================================================
+
+@dataclass
+class Branch:
+    """
+    Explicit branch model — the single source of truth for branch structure.
+
+    Key invariant: exit is ALWAYS path_nodes[-1], never inferred from CFG.
+    """
+    branch_id: str                              # BRANCH node ID (e.g., "br_s2")
+    eq_node: str                                # EQ node ID that computes condition
+    cond_var: str                               # Condition variable name
+    true_target: Optional[str] = None           # Step ID of true path entry
+    false_target: Optional[str] = None          # Step ID of false path entry
+    merge_step: Optional[str] = None            # Step ID of merge node
+    true_nodes: List[str] = field(default_factory=list)    # Node IDs on true path
+    false_nodes: List[str] = field(default_factory=list)   # Node IDs on false path
+
+    @property
+    def true_exit(self) -> Optional[str]:
+        """Exit = last node on true path. Never fallback to entry."""
+        return self.true_nodes[-1] if self.true_nodes else None
+
+    @property
+    def false_exit(self) -> Optional[str]:
+        """Exit = last node on false path. Never fallback to entry."""
+        return self.false_nodes[-1] if self.false_nodes else None
+
+
+# ============================================================
 # Trace Materialization + Memoization (v0.97)
 # ============================================================
 
@@ -2429,16 +2460,17 @@ class StructuralEquationSystem:
         """Build structural equations from IR with SSA-style version tracking."""
         # First pass: identify branch conditions
         for node_id, instr in self.graph.nodes.items():
-            if instr.op == "BRANCH" and instr.args:
+            if instr.op in ("BR", "BRANCH") and instr.args:
                 cond = instr.args[0]
                 if isinstance(cond, str) and cond.startswith("@"):
                     cond = cond[1:]
                 self.branch_conditions[node_id] = cond
 
-        # Find merge points (nodes with >1 predecessor)
+        # Find merge points - ONLY explicit MERGE nodes
+        # This is the key architectural change: merge is DEFINED, not detected
         merge_points = set()
-        for node_id, block in self.graph.cfg.blocks.items():
-            if len(block.predecessors) > 1:
+        for node_id, instr in self.graph.nodes.items():
+            if instr.op == "MERGE":
                 merge_points.add(node_id)
 
         # Track all definitions (SSA: each definition is a new version)
@@ -2487,7 +2519,7 @@ class StructuralEquationSystem:
                         common = self._find_common_ancestor(pred0, pred1)
                         if common:
                             branch_instr = self.graph.nodes.get(common)
-                            if branch_instr and branch_instr.op == "BRANCH":
+                            if branch_instr and branch_instr.op in ("BR", "BRANCH"):
                                 branch_node_id = common
                                 cond = branch_instr.args[0] if branch_instr.args else None
                                 if isinstance(cond, str) and cond.startswith("@"):
@@ -2501,14 +2533,15 @@ class StructuralEquationSystem:
 
                     if len(defs) >= 2:
                         # We need to know which predecessor is false and which is true
-                        # BRANCH next[0] = false target, next[1] = true target
+                        # BRANCH next[0] = true target, next[1] = false target
                         branch_instr = None
                         if branch_node_id:
                             branch_instr = self.graph.nodes.get(branch_node_id)
 
                         if branch_instr and branch_instr.next and len(branch_instr.next) >= 2:
-                            false_target = branch_instr.next[0]  # n5b
-                            true_target = branch_instr.next[1]   # n5a
+                            # BRANCH next[0] = true target, next[1] = false target
+                            true_target = branch_instr.next[0]   # n5b (when flag=True)
+                            false_target = branch_instr.next[1]  # n5a (when flag=False)
 
                             # Find which def corresponds to which branch
                             for pred_node, eq in defs:
@@ -2527,6 +2560,10 @@ class StructuralEquationSystem:
                     else:
                         continue
 
+                    # Skip phi if no branch condition found (uncontrolled merge)
+                    if not branch_cond:
+                        continue
+
                     # Find the versioned variable for the condition (R_flag)
                     # The condition var is an EXPLICIT causal parent of phi
                     cond_var = branch_cond  # e.g., "R_flag"
@@ -2539,7 +2576,7 @@ class StructuralEquationSystem:
                     if not cond_versioned:
                         cond_versioned = cond_var
 
-                    phi_var = f"phi_{node_id}_{var}"
+                    phi_var = f"phi${node_id}${var}"
                     phi_eq = Equation(
                         output_var=phi_var,
                         parent_vars=[false_var, true_var, cond_versioned],  # explicit causal parent!
@@ -2850,11 +2887,12 @@ class ExecutionGraph:
         for arg in instr.args:
             if isinstance(arg, str) and arg.startswith("@"):
                 instr.reads.add(arg[1:])
-        # writes: MOV dest, src → dest is args[0]; CALL/EQ/CMP/LOAD write to last arg
+        # writes: MOV dest, src → dest is args[0]; CALL/EQ/CMP/LOAD write to last arg; MERGE has no writes
         if op == "MOV" and len(args) >= 2:
             instr.writes.add(args[0])
         elif op in ("CALL", "EQ", "CMP", "LOAD") and len(args) >= 1:
             instr.writes.add(args[-1])
+        # MERGE is a pure control flow node - no registers written
 
         self.nodes[id] = instr
         if self.root is None:
@@ -2937,385 +2975,1302 @@ class ExecutionGraph:
 
 
 # ============================================================
-# v1.1 Agent-SCM Interface Layer
-# Transforms internal SCM IR → Agent-native debugging interface
+# v1.1 Agent-SCM Interface Layer (Domain-Agnostic)
 # ============================================================
 
 @dataclass
 class ToolDecision:
-    """Represents a tool selection decision at a merge point."""
+    """
+    DOMAIN-AGNOSTIC tool selection decision.
+
+    Contains NO business semantics - only structural decision information.
+    """
     node_id: str
-    condition_var: str
-    true_tool: str  # tool selected when condition=True
-    false_tool: str  # tool selected when condition=False
-    selected_tool: str  # actual tool that was chosen
-    outcome: Any  # output of the selected tool
+    condition_var: str  # internal variable name (e.g., "cond_7")
+    true_tool_id: str   # tool identifier when condition=True
+    false_tool_id: str  # tool identifier when condition=False
+    selected_tool_id: str  # what was actually selected
+    outcome_var: str  # which output variable was written
 
 
 @dataclass
 class AgentOverride:
-    """Represents a policy override (behavioral intervention)."""
+    """
+    DOMAIN-AGNOSTIC behavioral intervention.
+
+    This is NOT business-specific - any agent can use this.
+    """
     target_node: str
-    override_type: str  # "force_tool" | "skip_tool" | "force_branch"
-    value: Any
-    description: str
+    override_type: str  # "force_tool" | "force_branch"
+    tool_id: Optional[str] = None
+    condition_value: Optional[Any] = None
+    description: str = ""
+
+
+class ExogenousModel:
+    """
+    DOMAIN-AGNOSTIC model of external uncertainty.
+
+    U = exogenous variables = things outside the agent's control.
+
+    This is PLUGGABLE - you can implement real stochastic models:
+    - llm.sampling: stochastic token generation
+    - tool.latency: external API delays
+    - tool.failure: external service reliability
+    - memory.noise: retrieval imperfections
+    """
+
+    def __init__(self):
+        self.values = {}  # var -> value (can be set for counterfactual)
+
+    def sample(self, var: str, default: Any = None) -> Any:
+        """Get value, using stored value if set, else default."""
+        return self.values.get(var, default)
+
+    def set(self, var: str, value: Any):
+        """Set a specific exogenous value (for counterfactual consistency)."""
+        self.values[var] = value
+
+    def get(self, var: str, default: Any = None) -> Any:
+        return self.sample(var, default)
 
 
 class AgentIR:
     """
-    Agent-native interface on top of SCM.
+    DOMAIN-AGNOSTIC agent debugging interface.
 
-    Transforms:
-        phi_n6_R_out, R_flag_d0, do(R_flag=True)
-    Into:
-        tool_choice_merge(output=R_out), condition=severity_check, override_tool(node=6, tool="emergency")
+    Transforms internal SCM → Agent debugger (completely domain-agnostic)
 
     API Surface:
-        agent.why(node_id)         → why was this decision made?
-        agent.what_if(node_id, override) → what if we forced different behavior?
-        agent.blame(output_var)   → which decision caused this output?
+        agent.why(node_id)          → why was this decision made?
+        agent.what_if(node_id, ov)  → what if we forced different behavior?
+        agent.blame(output_var)    → which decision caused this output?
+        agent.attach_semantic(fn)  → optional: add domain labels (NOT required)
+
+    KEY: All outputs are decision/tool/condition structure.
+         NO business strings. NO hardcoded semantics.
     """
 
-    def __init__(self, graph: ExecutionGraph):
+    def __init__(self, graph: ExecutionGraph, exogenous: Optional[ExogenousModel] = None):
         self.graph = graph
         self.ses = StructuralEquationSystem(graph)
-        self._build_tool_map()  # Map phi-nodes to tool decisions
+        self.exogenous = exogenous or ExogenousModel()
+        self._semantic_fn = None  # optional: domain-specific label function
+        self._build_decision_map()
 
-    def _build_tool_map(self):
-        """Map phi-nodes to tool decisions based on branch structure."""
-        self.tool_decisions = {}  # node_id -> ToolDecision
-        self.phi_to_branch = {}   # phi_var -> controlling branch node
-        self.tool_semantics = {}  # phi_var -> human-readable description
+    def attach_semantic(self, fn: Callable[[str, ToolDecision], Optional[str]]):
+        """
+        Attach OPTIONAL domain semantics via a pluggable function.
 
-        # First, find all branches and their controlled merge points
-        branch_to_merge = {}  # branch_node -> list of merge points it controls
+        NOT required - debugger works without this.
+        But if you want labels, you can add them.
+
+        Example:
+            agent.attach_semantic(lambda node_id, decision: {
+                "n4": "criticality_check",
+            }.get(node_id))
+        """
+        self._semantic_fn = fn
+
+    def _build_decision_map(self):
+        """Build decision map (completely domain-agnostic)."""
+        self.decisions = {}  # node_id -> ToolDecision
+        self.phi_to_branch = {}  # phi_var -> controlling branch
+
+        # Find branches and their merge points
+        branch_to_merge = {}
         for node_id, block in self.graph.cfg.blocks.items():
             if len(block.predecessors) > 1:
-                # This is a merge point - find which branch controls it
                 preds = block.predecessors
-                # Find common ancestor that is a BRANCH
-                common = self._find_common_branchAncestor(preds[0], preds[1])
+                common = self._find_common_branch(preds[0], preds[1])
                 if common:
                     if common not in branch_to_merge:
                         branch_to_merge[common] = []
                     branch_to_merge[common].append(node_id)
 
-        # Build tool decisions for each phi-node
+        # Build decision for each phi
         for var, eq in self.ses.equations.items():
-            if var.startswith("phi_"):
-                # Parse phi_n6_R_out → node_id=n6, var=R_out
-                parts = var.split("_")
-                if len(parts) >= 3 and parts[0] == "phi":
-                    merge_node = parts[1]
-                    var_name = "_".join(parts[2:])
+            if not var.startswith("phi$"):
+                continue
+            parts = var.split("$")
+            if len(parts) < 3 or parts[0] != "phi":
+                continue
 
-                    # Find which branch controls this merge
-                    branch_node = None
-                    for bn, merges in branch_to_merge.items():
-                        if merge_node in merges:
-                            branch_node = bn
-                            break
+            merge_node = parts[1]
+            outcome_var = "$".join(parts[2:])
 
-                    # Get condition variable
-                    cond_var = self.ses.branch_conditions.get(branch_node, "unknown")
+            branch_node = None
+            for bn, merges in branch_to_merge.items():
+                if merge_node in merges:
+                    branch_node = bn
+                    break
 
-                    # Get the two possible tools (output values from MOV instructions at branch targets)
-                    true_tool = None
-                    false_tool = None
-                    if branch_node:
-                        branch_instr = self.graph.nodes.get(branch_node)
-                        if branch_instr and branch_instr.next:
-                            # branch.next[0] = false target, [1] = true target
-                            if len(branch_instr.next) >= 1:
-                                false_block = self.graph.nodes.get(branch_instr.next[0])
-                                if false_block:
-                                    # Get the MOV instruction's output value
-                                    mov = self.graph.nodes.get(branch_instr.next[0])
-                                    if mov and mov.op == "MOV" and len(mov.args) >= 2:
-                                        false_tool = mov.args[1]  # The actual output value
-                            if len(branch_instr.next) >= 2:
-                                true_block = self.graph.nodes.get(branch_instr.next[1])
-                                if true_block:
-                                    mov = self.graph.nodes.get(branch_instr.next[1])
-                                    if mov and mov.op == "MOV" and len(mov.args) >= 2:
-                                        true_tool = mov.args[1]  # The actual output value
+            if not branch_node:
+                continue
 
-                    # Determine selected tool based on current evaluation
-                    # The phi equation's parent_vars tell us which is true vs false
-                    selected = false_tool
-                    if eq.parent_vars and len(eq.parent_vars) >= 3:
-                        # Third parent is the condition - if it's True, true_tool is selected
-                        # We need to check actual outcome to determine
-                        pass
+            cond_var = self.ses.branch_conditions.get(branch_node, f"cond_{branch_node}")
+            true_tid = self._get_tool_id(branch_node, is_true=True)
+            false_tid = self._get_tool_id(branch_node, is_true=False)
+            selected = self._evaluate_selected(var, eq, true_tid, false_tid)
 
-                    # Store by BRANCH node (not merge node) - the decision happens at branch
-                    self.phi_to_branch[var] = branch_node
-                    self.tool_semantics[var] = f"tool_choice({var_name})"
+            self.phi_to_branch[var] = branch_node
+            self.decisions[branch_node] = ToolDecision(
+                node_id=branch_node,
+                condition_var=cond_var,
+                true_tool_id=true_tid,
+                false_tool_id=false_tid,
+                selected_tool_id=selected,
+                outcome_var=outcome_var
+            )
 
-                    if branch_node:
-                        self.tool_decisions[branch_node] = ToolDecision(
-                            node_id=branch_node,
-                            condition_var=cond_var,
-                            true_tool=true_tool or "emergency_handler",
-                            false_tool=false_tool or "normal_handler",
-                            selected_tool=self._get_selected_tool(var, eq),
-                            outcome=var_name
-                        )
-
-    def _find_common_branchAncestor(self, node_a: str, node_b: str) -> Optional[str]:
-        """Find common BRANCH ancestor of two nodes."""
+    def _find_common_branch(self, node_a: str, node_b: str) -> Optional[str]:
+        """Find common BRANCH ancestor."""
         ancestors_a = set()
         current = node_a
         while current:
             ancestors_a.add(current)
             block = self.graph.cfg.blocks.get(current)
-            if block and block.predecessors:
-                current = block.predecessors[0]
-            else:
-                current = None
+            current = block.predecessors[0] if block and block.predecessors else None
 
         current = node_b
         while current:
             if current in ancestors_a:
-                # Check if this node is a BRANCH
                 instr = self.graph.nodes.get(current)
                 if instr and instr.op == "BRANCH":
                     return current
-                # Keep going up to find BRANCH ancestor
             block = self.graph.cfg.blocks.get(current)
-            if block and block.predecessors:
-                current = block.predecessors[0]
-            else:
-                current = None
+            current = block.predecessors[0] if block and block.predecessors else None
         return None
 
-    def _get_selected_tool(self, phi_var: str, eq) -> str:
-        """Determine which tool is currently selected."""
-        # Get the true/false tools from branch
-        branch_node = self.phi_to_branch.get(phi_var)
-        if not branch_node:
-            return "unknown"
+    def _get_tool_id(self, branch_node: str, is_true: bool) -> str:
+        """Get tool ID from branch target (completely domain-agnostic)."""
+        instr = self.graph.nodes.get(branch_node)
+        if not instr or not instr.next:
+            return f"tool_{branch_node}"
 
-        branch_instr = self.graph.nodes.get(branch_node)
-        if not branch_instr or not branch_instr.next:
-            return "unknown"
+        # BRANCH next[0] = true target, next[1] = false target
+        idx = 0 if is_true else 1
+        if len(instr.next) <= idx:
+            idx = 0
 
-        # Default to false tool
-        if len(branch_instr.next) >= 1:
-            false_block = self.graph.nodes.get(branch_instr.next[0])
-            if false_block and false_block.writes:
-                return list(false_block.writes)[0]
-        return "unknown"
+        target = instr.next[idx]
+        # Return the target node id as the tool identifier (domain-agnostic)
+        # The actual semantics can be derived from the instruction at that node
+        return target
 
-    def _get_condition_description(self, cond_var: str) -> str:
-        """Convert internal variable name to agent-readable description."""
-        # Map internal names to semantic descriptions
-        semantic_map = {
-            "R_flag": "severity_check",
-            "severity": "severity_level",
-            "critical": "critical_detection",
-            "tool_selected": "tool_selection",
-        }
-        return semantic_map.get(cond_var, cond_var)
+    def _evaluate_selected(self, phi_var: str, eq, true_tid: str, false_tid: str) -> str:
+        """Determine which tool was selected."""
+        result = self.ses.evaluate(self._get_U(), {})
+        eq_obj = self.ses.equations.get(phi_var)
+        if eq_obj and len(eq_obj.parent_vars) >= 3:
+            cond_val = result.get(eq_obj.parent_vars[2], False)
+            return true_tid if cond_val else false_tid
+        return false_tid
+
+    def _get_U(self) -> Dict[str, Any]:
+        """Get exogenous values."""
+        U = {}
+        for var in self.ses.equations:
+            val = self.exogenous.get(var)
+            if val is not None:
+                U[var] = val
+        return U
 
     def why(self, node_id: str) -> Dict[str, Any]:
         """
-        Question: Why was this decision node triggered?
+        Question: Why was this decision made?
 
-        Returns: explanation of what caused this decision point
+        Returns DOMAIN-AGNOSTIC explanation:
+        {
+            node: "n4",
+            decision: "tool_selection",
+            condition_var: "cond_4",
+            condition_value: true/false,
+            options: {when_true: "tool_A", when_false: "tool_B"},
+            selected_tool: "tool_A",
+            outcome_var: "output_1",
+            semantic_label: "criticality_check"  # if attached
+        }
         """
-        if node_id not in self.tool_decisions:
-            return {"error": f"No decision found at node {node_id}"}
+        if node_id not in self.decisions:
+            return {"error": f"No decision at node {node_id}", "node": node_id}
 
-        decision = self.tool_decisions[node_id]
-        cond_desc = self._get_condition_description(decision.condition_var)
-        actual_selected = self._get_actual_selected_tool(node_id, decision)
+        d = self.decisions[node_id]
+        cond_val = self._get_condition_value(node_id)
+
+        semantic = None
+        if self._semantic_fn:
+            try:
+                semantic = self._semantic_fn(node_id, d)
+            except:
+                pass
 
         return {
             "node": node_id,
-            "type": "tool_selection_decision",
-            "condition": decision.condition_var,
-            "condition_description": cond_desc,
-            "options": {
-                "when_true": decision.true_tool,
-                "when_false": decision.false_tool
-            },
-            "selected": actual_selected,
-            "explanation": f"Decision at node {node_id} selects {actual_selected} because {cond_desc}={self._get_condition_value(node_id)}"
+            "decision": "tool_selection",
+            "condition_var": d.condition_var,
+            "condition_value": cond_val,
+            "options": {"when_true": d.true_tool_id, "when_false": d.false_tool_id},
+            "selected_tool": d.selected_tool_id,
+            "outcome_var": d.outcome_var,
+            "semantic_label": semantic,
+            "causal_chain": self._get_causal_chain(node_id)
         }
-
-    def _get_condition_value(self, node_id: str) -> Any:
-        """Get the actual boolean value of the condition at this node."""
-        U = self._build_exogenous_U()
-        result = self.ses.evaluate(U, {})
-        decision = self.tool_decisions.get(node_id)
-        if not decision:
-            return "unknown"
-        phi_var = self._find_phi_for_branch(node_id, decision.outcome)
-        eq = self.ses.equations.get(phi_var)
-        if eq and len(eq.parent_vars) >= 3:
-            return result.get(eq.parent_vars[2])
-        return "unknown"
 
     def what_if(self, node_id: str, override: AgentOverride) -> Dict[str, Any]:
         """
         Question: What if we forced a different decision?
-
-        Example:
-            agent.what_if("n4", override=AgentOverride(
-                target_node="n4",
-                override_type="force_branch",
-                value=True,
-                description="force emergency path"
-            ))
         """
-        if node_id not in self.tool_decisions:
-            return {"error": f"No decision found at node {node_id}"}
+        if node_id not in self.decisions:
+            return {"error": f"No decision at node {node_id}"}
 
-        decision = self.tool_decisions[node_id]
+        d = self.decisions[node_id]
 
-        # Map override to intervention
         if override.override_type == "force_tool":
-            intervention = {decision.condition_var: override.value}
-        elif override.override_type == "force_branch":
-            intervention = {decision.condition_var: override.value}
+            if override.tool_id == d.true_tool_id:
+                intervention = {d.condition_var: True}
+            elif override.tool_id == d.false_tool_id:
+                intervention = {d.condition_var: False}
+            else:
+                intervention = {d.condition_var: override.condition_value}
         else:
-            intervention = {override.target_node: override.value}
+            intervention = {d.condition_var: override.condition_value}
 
-        # Build U with necessary values for factual evaluation
-        U = self._build_exogenous_U()
-
-        # Find the phi variable for this decision - need to find merge node
-        phi_var = self._find_phi_for_branch(node_id, decision.outcome)
-
-        # Compute factual first
-        factual = self.ses.evaluate(U, {})
-
-        # Compute counterfactual with intervention
+        factual = self.ses.evaluate(self._get_U(), {})
         cf_ses = self.ses.do_intervene(intervention)
-        U_cf = dict(U)
+        U_cf = dict(self._get_U())
         U_cf.update(intervention)
         counterfactual = cf_ses.evaluate(U_cf, {})
 
-        factual_outcome = factual.get(phi_var) if phi_var else None
-        counterfactual_outcome = counterfactual.get(phi_var) if phi_var else None
+        phi_var = self._find_phi(node_id, d.outcome_var)
+        factual_outcome = factual.get(phi_var)
+        counterfactual_outcome = counterfactual.get(phi_var)
 
         return {
-            "original_decision": self._get_actual_selected_tool(node_id, decision),
-            "override_applied": override.description,
+            "node": node_id,
+            "original_decision": d.selected_tool_id,
+            "factual_outcome_var": d.outcome_var,
             "factual_outcome": factual_outcome,
             "counterfactual_outcome": counterfactual_outcome,
-            "changed": factual_outcome != counterfactual_outcome,
+            "would_change": factual_outcome != counterfactual_outcome,
+            "override": override.description or f"force {override.tool_id}",
             "intervention": intervention
         }
-
-    def _find_phi_for_branch(self, branch_node: str, outcome_var: str) -> str:
-        """Find the phi variable that corresponds to a branch node's decision."""
-        for phi_var, bn in self.phi_to_branch.items():
-            if bn == branch_node and outcome_var in phi_var:
-                return phi_var
-        return f"phi_UNKNOWN_{outcome_var}"
-
-    def _build_exogenous_U(self) -> Dict[str, Any]:
-        """Build minimal U for factual evaluation."""
-        U = {}
-        # For each CALL equation, provide a default result
-        for var, eq in self.ses.equations.items():
-            if hasattr(eq, 'fn') and 'call' in str(eq.fn):
-                U[f"call_{var}"] = U.get(f"call_{var}", "CALL(default)")
-        # Provide R_result from CALL
-        U['R_result'] = "CALL(diagnose)"
-        return U
 
     def blame(self, output_var: str) -> Dict[str, Any]:
         """
         Question: Which decision caused this output?
-
-        Traces back from output to the decision nodes that determined it.
         """
-        # Find all phi-nodes that contribute to this output
-        contributing_decisions = []
-
-        # phi_to_branch maps phi_var -> controlling branch node
-        for phi_var, branch_node in self.phi_to_branch.items():
-            # Check if output_var is part of this phi node's name
-            if output_var in phi_var and branch_node in self.tool_decisions:
-                decision = self.tool_decisions[branch_node]
-                contributing_decisions.append({
-                    "node": branch_node,
-                    "condition": decision.condition_var,
-                    "condition_description": self._get_condition_description(decision.condition_var),
-                    "selected_tool": self._get_actual_selected_tool(branch_node, decision),
+        contributing = []
+        for phi_var, bn in self.phi_to_branch.items():
+            if output_var in phi_var and bn in self.decisions:
+                d = self.decisions[bn]
+                contributing.append({
+                    "node": bn,
+                    "decision": "tool_selection",
+                    "condition_var": d.condition_var,
+                    "selected_tool": d.selected_tool_id,
+                    "outcome_var": d.outcome_var,
                     "impact": "direct"
                 })
 
         return {
-            "output": output_var,
-            "contributing_decisions": contributing_decisions,
-            "root_cause": contributing_decisions[0] if contributing_decisions else None
+            "output_var": output_var,
+            "root_cause": contributing[0] if contributing else None,
+            "contributing_decisions": contributing
         }
 
-    def _get_actual_selected_tool(self, node_id: str, decision) -> str:
-        """Determine actual selected tool based on current evaluation."""
-        U = self._build_exogenous_U()
-        phi_var = f"phi_{node_id}_{decision.outcome}"
-
-        # Evaluate to find which branch was taken
-        result = self.ses.evaluate(U, {})
-
-        # The phi node's third parent is the condition
+    def _get_condition_value(self, node_id: str) -> Any:
+        result = self.ses.evaluate(self._get_U(), {})
+        d = self.decisions.get(node_id)
+        if not d:
+            return None
+        phi_var = self._find_phi(node_id, d.outcome_var)
         eq = self.ses.equations.get(phi_var)
         if eq and len(eq.parent_vars) >= 3:
-            cond_val = result.get(eq.parent_vars[2], False)
-            return decision.true_tool if cond_val else decision.false_tool
+            return result.get(eq.parent_vars[2])
+        return None
 
-        return decision.false_tool
+    def _find_phi(self, branch_node: str, outcome_var: str) -> str:
+        for phi_var, bn in self.phi_to_branch.items():
+            if bn == branch_node and outcome_var in phi_var:
+                return phi_var
+        return f"phi_{branch_node}_{outcome_var}"
 
-    def override_tool(self, node_id: str, tool: str) -> AgentOverride:
+    def _get_causal_chain(self, node_id: str) -> List[str]:
+        chain = []
+        d = self.decisions.get(node_id)
+        if not d:
+            return chain
+        phi_var = self._find_phi(node_id, d.outcome_var)
+        eq = self.ses.equations.get(phi_var)
+        if eq:
+            for parent in eq.parent_vars:
+                if parent != d.condition_var:
+                    chain.append(parent)
+        if d.condition_var not in chain:
+            chain.insert(0, d.condition_var)
+        return chain
+
+    def override_tool(self, node_id: str, tool_id: str) -> AgentOverride:
         """
-        Convenience method: force specific tool at decision node.
-
-        Example:
-            override = agent.override_tool("n4", tool="EMERGENCY PROTOCOL: CALL 911")
+        Convenience: create override to force a specific tool.
         """
-        decision = self.tool_decisions.get(node_id)
-        if not decision:
-            return None
+        d = self.decisions.get(node_id)
+        if not d:
+            return AgentOverride(target_node=node_id, override_type="force_tool",
+                                tool_id=tool_id, description=f"force {tool_id}")
 
-        # Map desired tool to condition value
-        # User wants to select a specific tool - we need to figure out what
-        # condition value would cause that tool to be selected
-        if tool == decision.true_tool:
-            # User wants the TRUE branch tool - set condition to True
-            value = True
-        elif tool == decision.false_tool:
-            # User wants the FALSE branch tool - set condition to False
-            value = False
-        else:
-            value = tool
-
+        is_true = tool_id == d.true_tool_id
         return AgentOverride(
             target_node=node_id,
             override_type="force_tool",
-            value=value,
-            description=f"force tool={tool} at node {node_id}"
+            tool_id=tool_id,
+            condition_value=is_true,
+            description=f"force tool={tool_id} at node {node_id}"
         )
 
-    def explain_full(self) -> str:
-        """Human-readable explanation of the agent's decision graph."""
-        lines = ["=== AGENT DECISION GRAPH ===", ""]
+    def explain(self) -> str:
+        """Human-readable explanation (domain-agnostic)."""
+        lines = ["=== AGENT DECISION GRAPH (Domain-Agnostic) ===", ""]
 
-        for node_id, decision in sorted(self.tool_decisions.items()):
-            actual_selected = self._get_actual_selected_tool(node_id, decision)
+        for node_id, d in sorted(self.decisions.items()):
             cond_val = self._get_condition_value(node_id)
-            lines.append(f"Node {node_id}: TOOL SELECTION")
-            lines.append(f"  Condition: {self._get_condition_description(decision.condition_var)} ({decision.condition_var}) = {cond_val}")
-            lines.append(f"  When TRUE:  {decision.true_tool}")
-            lines.append(f"  When FALSE: {decision.false_tool}")
-            lines.append(f"  Selected:   {actual_selected}")
+            semantic = ""
+            if self._semantic_fn:
+                try:
+                    lbl = self._semantic_fn(node_id, d)
+                    if lbl:
+                        semantic = f" ({lbl})"
+                except:
+                    pass
+
+            lines.append(f"Node {node_id}: TOOL SELECTION{semantic}")
+            lines.append(f"  Condition: {d.condition_var} = {cond_val}")
+            lines.append(f"  When TRUE:  {d.true_tool_id}")
+            lines.append(f"  When FALSE: {d.false_tool_id}")
+            lines.append(f"  Selected:   {d.selected_tool_id}")
+            lines.append(f"  Output:     {d.outcome_var}")
             lines.append("")
 
         return "\n".join(lines)
+
+    def why_counterfactual(self, node_id: str) -> Dict[str, Any]:
+        """
+        Counterfactual why: explains WHY this decision was made.
+
+        Returns:
+        {
+            "node": "n4",
+            "factual": {
+                "condition": true,
+                "selected": "tool_A",
+                "outcome": "output_X"
+            },
+            "counterfactual": {
+                "if_condition_flipped": true,
+                "would_select": "tool_B",
+                "would_change_output": true,
+                "impact": "final_answer would change to Y"
+            }
+        }
+        """
+        if node_id not in self.decisions:
+            return {"error": f"No decision at node {node_id}"}
+
+        d = self.decisions[node_id]
+        factual_cond = self._get_condition_value(node_id)
+
+        # Get factual outcome
+        phi_var = self._find_phi(node_id, d.outcome_var)
+        factual = self.ses.evaluate(self._get_U(), {})
+        factual_outcome = factual.get(phi_var)
+
+        # Compute counterfactual: flip condition
+        flip_value = not factual_cond if isinstance(factual_cond, bool) else True
+        cf_ses = self.ses.do_intervene({d.condition_var: flip_value})
+        U_cf = dict(self._get_U())
+        U_cf[d.condition_var] = flip_value
+        cf_result = cf_ses.evaluate(U_cf, {})
+        cf_outcome = cf_result.get(phi_var)
+
+        return {
+            "node": node_id,
+            "decision": "tool_selection",
+            "factual": {
+                "condition_var": d.condition_var,
+                "condition_value": factual_cond,
+                "selected_tool": d.selected_tool_id,
+                "outcome": factual_outcome
+            },
+            "counterfactual": {
+                "if_condition_value": flip_value,
+                "would_select": d.true_tool_id if not factual_cond else d.false_tool_id,
+                "would_change_output": factual_outcome != cf_outcome,
+                "outcome": cf_outcome
+            }
+        }
+
+    def minimal_causes(self, output_var: str) -> Dict[str, Any]:
+        """
+        Find MINIMAL set of decisions that caused the output.
+
+        This is the KILLER FEATURE: returns the smallest set of
+        interventions needed to change the output.
+
+        Returns:
+        {
+            "output_var": "final_answer",
+            "factual_value": "X",
+            "minimal_causes": [
+                {
+                    "node": "n4",
+                    "condition": "cond_4",
+                    "current_value": true,
+                    "would_change_output": true,
+                    "necessary": true
+                }
+            ],
+            "alternative_minimal_sets": [...]
+        }
+        """
+        # Find all decisions that contribute to this output
+        contributing = []
+        for phi_var, bn in self.phi_to_branch.items():
+            if output_var in phi_var and bn in self.decisions:
+                d = self.decisions[bn]
+                phi_var_actual = self._find_phi(bn, d.outcome_var)
+
+                # Evaluate with and without this condition
+                factual = self.ses.evaluate(self._get_U(), {})
+                factual_outcome = factual.get(phi_var_actual)
+
+                # Remove this condition and see if output changes
+                cf_ses = self.ses.do_intervene({d.condition_var: not self._get_condition_value(bn)})
+                U_cf = dict(self._get_U())
+                U_cf[d.condition_var] = not self._get_condition_value(bn)
+                cf_outcome = cf_ses.evaluate(U_cf, {}).get(phi_var_actual)
+
+                would_change = factual_outcome != cf_outcome
+
+                contributing.append({
+                    "node": bn,
+                    "condition_var": d.condition_var,
+                    "current_value": self._get_condition_value(bn),
+                    "factual_outcome": factual_outcome,
+                    "counterfactual_outcome": cf_outcome,
+                    "would_change_output": would_change,
+                    "selected_tool": d.selected_tool_id,
+                    "alternative_tool": d.true_tool_id if d.selected_tool_id == d.false_tool_id else d.false_tool_id
+                })
+
+        # Filter to only necessary causes (changing them WOULD change output)
+        minimal = [c for c in contributing if c["would_change_output"]]
+
+        # Sort by impact
+        minimal.sort(key=lambda x: x["would_change_output"], reverse=True)
+
+        return {
+            "output_var": output_var,
+            "factual_value": minimal[0]["factual_outcome"] if minimal else None,
+            "minimal_causes": minimal,
+            "total_decisions_checked": len(contributing),
+            "necessary_decisions": len(minimal)
+        }
+
+    def explain_counterfactual(self, node_id: str) -> str:
+        """Human-readable counterfactual explanation."""
+        result = self.why_counterfactual(node_id)
+
+        if "error" in result:
+            return result["error"]
+
+        f = result["factual"]
+        c = result["counterfactual"]
+
+        lines = [
+            f"=== WHY at node {node_id}? ===",
+            f"",
+            f"FACTUAL:",
+            f"  Condition {f['condition_var']} = {f['condition_value']}",
+            f"  Selected: {f['selected_tool']}",
+            f"  Outcome: {f['outcome']}",
+            f"",
+            f"COUNTERFACTUAL:",
+            f"  If {f['condition_var']} = {c['if_condition_value']},",
+            f"  Would select: {c['would_select']}",
+            f"  Would outcome change: {c['would_change_output']}",
+            f"  New outcome: {c['outcome']}",
+        ]
+
+        return "\n".join(lines)
+
+    def explain_minimal(self, output_var: str) -> str:
+        """Human-readable minimal causes explanation."""
+        result = self.minimal_causes(output_var)
+
+        if "error" in result and result["error"]:
+            return result["error"]
+
+        lines = [
+            f"=== MINIMAL CAUSES for {output_var} ===",
+            f"",
+            f"Factual value: {result['factual_value']}",
+            f"Necessary decisions: {result['necessary_decisions']} of {result['total_decisions_checked']}",
+            f"",
+        ]
+
+        for cause in result["minimal_causes"]:
+            lines.append(f"Node {cause['node']}:")
+            lines.append(f"  Condition: {cause['condition_var']} = {cause['current_value']}")
+            lines.append(f"  Selected: {cause['selected_tool']}")
+            lines.append(f"  If flipped: {cause['alternative_tool']}")
+            lines.append(f"  Output would change: {cause['would_change_output']}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+
+# ============================================================
+# v2.0 Trace → IR Compiler (Production-Grade)
+# Stable, deterministic engine: Agent Trace → ExecutionGraph
+# ============================================================
+
+
+class TraceCompiler:
+    """
+    Production-grade trace → ExecutionGraph compiler (v2.0).
+
+    Three deterministic phases:
+      1. Parse trace → create nodes + Branch objects
+      2. Collect path nodes from trace order
+      3. One-shot CFG materialization from Branch data
+
+    Key invariants:
+      - Branch.exit = path_nodes[-1] (always, never entry fallback)
+      - CFG is final output expression, never queried as data source
+      - No sequential fallback for branch structure derivation
+      - No multi-round wiring correction
+    """
+
+    def __init__(self):
+        self.node_counter = 0
+        self.step_to_node: Dict[str, str] = {}
+        self.branches: Dict[str, Branch] = {}
+
+    def _reset(self):
+        self.node_counter = 0
+        self.step_to_node = {}
+        self.branches = {}
+
+    # ================================================================
+    # Phase 1: Trace Parsing — create nodes + Branch objects
+    # ================================================================
+
+    def compile(self, trace: Dict[str, Any]) -> ExecutionGraph:
+        """
+        Compile an agent trace into ExecutionGraph.
+
+        Args:
+            trace: {"steps": [...], "metadata": {...}}
+        Returns:
+            ExecutionGraph with correct CFG structure
+        """
+        self._reset()
+        steps = trace.get("steps", [])
+        graph = ExecutionGraph()
+
+        # Phase 1: Create all nodes, collect Branch objects
+        prev_node = None
+        for step in steps:
+            node_id = self._create_nodes(graph, step, prev_node)
+            self.step_to_node[step["id"]] = node_id
+            prev_node = node_id
+
+        # Phase 2: Collect path nodes from trace order
+        self._collect_all_paths(steps)
+
+        # Phase 3: One-shot CFG materialization from Branch data
+        self._materialize(graph, steps)
+
+        # Build CFG (output only, never queried as data source)
+        graph.build_cfg()
+
+        return graph
+
+    def _next_node(self) -> str:
+        self.node_counter += 1
+        return f"n{self.node_counter}"
+
+    def _create_nodes(self, graph: ExecutionGraph, step: Dict, prev_node: Optional[str]) -> str:
+        step_type = step.get("type")
+
+        if step_type == "branch":
+            return self._create_branch_nodes(graph, step, prev_node)
+        elif step_type == "merge":
+            return self._create_merge_node(graph, step, prev_node)
+        else:
+            return self._create_simple_node(graph, step, prev_node, step_type)
+
+    def _create_branch_nodes(self, graph: ExecutionGraph, step: Dict, prev_node: Optional[str]) -> str:
+        """
+        Create EQ + BRANCH nodes and a Branch object.
+
+        BRANCH.next stores step IDs (resolved to node IDs in _materialize).
+        """
+        node_id = step.get("id", self._next_node())
+        condition = step.get("condition", "cond")
+        value = step.get("value", False)
+
+        # EQ node: computes condition value == True
+        cond_var = f"cond_{node_id}"
+        graph.instr(node_id, "EQ", [str(value), "True", cond_var], [])
+
+        # Wire prev → EQ (sequential, prev is never a branch target)
+        if prev_node and prev_node in graph.nodes:
+            graph.nodes[prev_node].next = [node_id]
+
+        # BRANCH node
+        branch_id = f"br_{node_id}"
+        true_target = step.get("true_branch")
+        false_target = step.get("false_branch")
+        merge_step = step.get("merge")
+
+        # BRANCH.next = [true_entry, false_entry] as step IDs
+        next_list = [t for t in [true_target, false_target] if t]
+        graph.instr(branch_id, "BRANCH", [cond_var], next_list)
+
+        # EQ → BRANCH
+        graph.nodes[node_id].next = [branch_id]
+
+        # Branch object created (paths collected in Phase 2)
+        branch = Branch(
+            branch_id=branch_id,
+            eq_node=node_id,
+            cond_var=cond_var,
+            true_target=true_target,
+            false_target=false_target,
+            merge_step=merge_step,
+        )
+        self.branches[branch_id] = branch
+
+        return node_id  # Return EQ node ID (sequential wiring goes through EQ→BRANCH)
+
+    def _create_merge_node(self, graph: ExecutionGraph, step: Dict, prev_node: Optional[str]) -> str:
+        """Create a MERGE node — convergence point for branch exits."""
+        node_id = step.get("id", self._next_node())
+        graph.instr(node_id, "MERGE", [], [])
+
+        # Merge node is a convergence point — no sequential wiring here.
+        # All wiring to/from merge happens in _materialize Phase 3.
+        return node_id
+
+    def _create_simple_node(self, graph: ExecutionGraph, step: Dict, prev_node: Optional[str],
+                           step_type: str) -> str:
+        """Create a non-branch, non-merge node (llm, tool, output, nop)."""
+        node_id = step.get("id", self._next_node())
+
+        if step_type == "llm":
+            output_var = step.get("output_var", f"llm_{node_id}")
+            prompt = step.get("prompt", "")
+            output = step.get("output", "")
+            graph.instr(node_id, "MOV", [output_var, output or f"LLM({prompt[:50]}...)"], [])
+        elif step_type == "tool":
+            tool_name = step.get("name", "unknown")
+            tool_args = step.get("args", {})
+            output_var = step.get("output_var", f"tool_{tool_name}_{node_id}")
+            graph.instr(node_id, "CALL", ["tool", tool_name, str(tool_args), output_var], [])
+        elif step_type == "output":
+            output_var = step.get("var", "output")
+            output_value = step.get("value", "")
+            graph.instr(node_id, "MOV", [output_var, str(output_value)], [])
+            halt_node = self._next_node()
+            graph.instr(halt_node, "HALT", [], [])
+            graph.nodes[node_id].next = [halt_node]
+        else:
+            graph.instr(node_id, "MOV", ["_", "_"], [])
+
+        # No sequential wiring in Phase 1 — all handled in _materialize Phase 3.
+        return node_id
+
+    def _get_branch_targets(self) -> Set[str]:
+        """Set of step IDs that are branch entry points."""
+        targets = set()
+        for branch in self.branches.values():
+            if branch.true_target:
+                targets.add(branch.true_target)
+            if branch.false_target:
+                targets.add(branch.false_target)
+        return targets
+
+    def _find_step_for_node(self, node_id: Optional[str]) -> Optional[str]:
+        """Reverse lookup: node_id → step_id."""
+        if not node_id:
+            return None
+        for sid, nid in self.step_to_node.items():
+            if nid == node_id:
+                return sid
+        return None
+
+    # ================================================================
+    # Phase 2: Path Collection — deterministic walk through trace
+    # ================================================================
+
+    def _collect_all_paths(self, steps: List[Dict]):
+        """Collect true_nodes and false_nodes for each branch from trace order."""
+        for branch in self.branches.values():
+            branch.true_nodes = self._collect_path(
+                steps, branch.true_target, branch.false_target, branch.merge_step
+            )
+            branch.false_nodes = self._collect_path(
+                steps, branch.false_target, branch.true_target, branch.merge_step
+            )
+
+    def _collect_path(self, steps: List[Dict], start_id: Optional[str],
+                      other_side_id: Optional[str], merge_id: Optional[str]) -> List[str]:
+        """
+        Walk from start_id through linear trace, collecting node IDs
+        until merge_id or other_side_id is reached.
+
+        Deterministic: path order = trace order.
+        Exit = path_nodes[-1] (last node before merge/other-side).
+
+        If start_id == merge_id, the path is empty (branch goes directly to merge).
+        """
+        if not start_id:
+            return []
+        if start_id == merge_id:
+            return []  # Branch target IS the merge node
+
+        nodes = []
+        collecting = False
+
+        for step in steps:
+            sid = step.get("id")
+            if sid == start_id:
+                collecting = True
+                if sid in self.step_to_node:
+                    nodes.append(self.step_to_node[sid])
+                continue
+            if collecting:
+                if sid == merge_id or sid == other_side_id:
+                    break
+                if sid in self.step_to_node:
+                    nodes.append(self.step_to_node[sid])
+
+        return nodes
+
+    # ================================================================
+    # Phase 3: CFG Materialization — one-shot wiring from Branch data
+    # ================================================================
+
+    def _materialize(self, graph: ExecutionGraph, steps: List[Dict]):
+        """
+        One-shot wiring from Branch data. No CFG queries, no fallback.
+
+        1. Resolve BRANCH.next step IDs → node IDs
+        2. Wire true_exit → merge, false_exit → merge
+        3. Wire sequential links for remaining unwired nodes
+        """
+        branch_target_steps = self._get_branch_targets()
+
+        # 1. Resolve BRANCH.next step IDs → node IDs
+        for branch in self.branches.values():
+            br_instr = graph.nodes.get(branch.branch_id)
+            if br_instr:
+                resolved = []
+                for target in br_instr.next:
+                    node = self.step_to_node.get(target)
+                    if node:
+                        resolved.append(node)
+                if resolved:
+                    br_instr.next = resolved
+
+        # 2. Wire true_exit → merge, false_exit → merge
+        for branch in self.branches.values():
+            merge_node = self.step_to_node.get(branch.merge_step) if branch.merge_step else None
+            if not merge_node:
+                continue
+
+            # true_exit is ALWAYS true_nodes[-1] (never fallback to entry)
+            if branch.true_exit and branch.true_exit in graph.nodes:
+                exit_instr = graph.nodes[branch.true_exit]
+                # Don't self-loop; don't touch BRANCH nodes
+                if (exit_instr.op not in ("BRANCH",)
+                        and branch.true_exit != merge_node):
+                    # Overwrite: branch exit always goes to merge
+                    exit_instr.next = [merge_node]
+
+            # false_exit is ALWAYS false_nodes[-1] (never fallback to entry)
+            if branch.false_exit and branch.false_exit in graph.nodes:
+                exit_instr = graph.nodes[branch.false_exit]
+                if (exit_instr.op not in ("BRANCH",)
+                        and branch.false_exit != merge_node):
+                    exit_instr.next = [merge_node]
+
+        # 3. Wire sequential links for remaining unwired nodes
+        # Walk steps in trace order; wire each unwired node to the next
+        # non-branch-target node in the trace
+        step_node_ids = []
+        for step in steps:
+            sid = step.get("id")
+            if sid in self.step_to_node:
+                step_node_ids.append(self.step_to_node[sid])
+
+        for i, node_id in enumerate(step_node_ids):
+            instr = graph.nodes.get(node_id)
+            if not instr or instr.next or instr.op in ("HALT", "BRANCH"):
+                continue
+
+            # Find next node in trace order to wire to
+            for j in range(i + 1, len(step_node_ids)):
+                next_id = step_node_ids[j]
+                next_step = self._find_step_for_node(next_id)
+
+                # Don't wire to branch targets (they come from BRANCH)
+                if next_step in branch_target_steps:
+                    continue
+
+                next_instr = graph.nodes.get(next_id)
+                if next_instr and next_instr.op not in ("HALT",):
+                    instr.next = [next_id]
+                    break
+
+    # ================================================================
+    # Backward-compatible _link_branches (no-op)
+    # ================================================================
+
+    def _link_branches(self, graph: ExecutionGraph):
+        """Validate CFG structure. No-op kept for backward compatibility."""
+        pass
+
+
+
+# ============================================================
+# v2.0 Universal Agent Trace Capture System
+# ============================================================
+
+@dataclass
+class AgentStep:
+    """A single step in an agent trace with observability fields."""
+    step_id: str
+    step_type: str  # "llm" | "tool" | "branch" | "merge" | "output"
+    # For LLM steps
+    prompt: Optional[str] = None
+    llm_output: Optional[str] = None
+    # For tool steps
+    tool_name: Optional[str] = None
+    tool_args: Optional[Dict] = None
+    tool_result: Optional[Any] = None
+    # For branch steps
+    condition: Optional[str] = None
+    condition_value: Optional[Any] = None
+    true_branch: Optional[str] = None
+    false_branch: Optional[str] = None
+    # For merge steps
+    merge_sources: Optional[List[str]] = None
+    # For output steps
+    output_var: Optional[str] = None
+    output_value: Optional[Any] = None
+    # Observability
+    start_time: Optional[float] = None   # Unix timestamp
+    end_time: Optional[float] = None     # Unix timestamp
+    latency_ms: Optional[float] = None   # Computed latency
+    status: str = "success"              # "success" | "error" | "pending"
+    error: Optional[str] = None          # Error message if status == "error"
+
+
+class TraceCapture:
+    """
+    Universal trace capture - records agent execution for causal analysis.
+
+    Usage:
+        capture = TraceCapture()
+
+        # Record steps
+        llm_id = capture.record_llm("User feels chest pain", "Checking symptoms...")
+        tool_id = capture.record_tool("diagnose", {"symptoms": "chest pain"}, "CRITICAL")
+        branch_id = capture.record_branch("severity == CRITICAL", True,
+                                          true_step=tool_id, false_step=None)
+
+        # Compile to ExecutionGraph
+        graph = capture.compile()
+        ir = AgentIR(graph)
+        ir.why_counterfactual(branch_id)
+    """
+
+    def __init__(self):
+        self.steps = []
+        self.step_index = 0
+        self._start_times = {}  # step_id -> start_time
+
+    def _step_start(self, step_id: str):
+        import time
+        self._start_times[step_id] = time.time()
+
+    def _step_end(self, step_id: str, status: str = "success", error: str = None):
+        import time
+        end_time = time.time()
+        start_time = self._start_times.get(step_id, end_time)
+        return {
+            "start_time": start_time,
+            "end_time": end_time,
+            "latency_ms": (end_time - start_time) * 1000,
+            "status": status,
+            "error": error,
+        }
+
+    def record_llm(self, prompt: str, output: str = None,
+                   metadata: Dict = None, step_id: str = None) -> str:
+        """Record an LLM call with timing."""
+        if step_id is None:
+            step_id = f"llm_{self.step_index}"
+        self.step_index += 1
+        self._step_start(step_id)
+        obs = self._step_end(step_id)
+        self.steps.append({
+            "type": "llm", "id": step_id,
+            "prompt": prompt, "output": output or "",
+            "metadata": metadata or {},
+            **obs
+        })
+        return step_id
+
+    def record_tool(self, name: str, args: Dict = None, result: Any = None,
+                    metadata: Dict = None, status: str = "success",
+                    error: str = None, step_id: str = None) -> str:
+        """Record a tool call with timing."""
+        if step_id is None:
+            step_id = f"tool_{self.step_index}"
+        self.step_index += 1
+        self._step_start(step_id)
+        obs = self._step_end(step_id, status, error)
+        self.steps.append({
+            "type": "tool", "id": step_id,
+            "name": name, "args": args or {}, "result": result,
+            "metadata": metadata or {},
+            **obs
+        })
+        return step_id
+
+    def record_branch(self, condition: str, value: Any,
+                      true_step: str = None, false_step: str = None,
+                      merge_step: str = None,
+                      metadata: Dict = None) -> str:
+        """Record a branching decision with timing."""
+        step_id = f"branch_{self.step_index}"
+        self.step_index += 1
+        self._step_start(step_id)
+        obs = self._step_end(step_id)
+        self.steps.append({
+            "type": "branch", "id": step_id,
+            "condition": condition, "value": value,
+            "true_branch": true_step, "false_branch": false_step,
+            "merge": merge_step,
+            "metadata": metadata or {},
+            **obs
+        })
+        return step_id
+
+    def record_merge(self, step_id: str = None) -> str:
+        """Record an explicit merge point."""
+        if step_id is None:
+            step_id = f"merge_{self.step_index}"
+            self.step_index += 1
+        self._step_start(step_id)
+        obs = self._step_end(step_id)
+        self.steps.append({
+            "type": "merge", "id": step_id,
+            "start_time": obs["start_time"],
+            "end_time": obs["end_time"],
+            "latency_ms": obs["latency_ms"],
+            "status": obs["status"],
+        })
+        return step_id
+
+    def record_output(self, var: str, value: Any,
+                      metadata: Dict = None, step_id: str = None) -> str:
+        """Record final output with timing."""
+        if step_id is None:
+            step_id = f"output_{self.step_index}"
+        self.step_index += 1
+        self._step_start(step_id)
+        obs = self._step_end(step_id)
+        self.steps.append({
+            "type": "output", "id": step_id,
+            "var": var, "value": value,
+            "metadata": metadata or {},
+            **obs
+        })
+        return step_id
+
+    def get_trace(self) -> Dict:
+        """Get the full trace dict ready for compilation."""
+        return {"steps": self.steps}
+
+    def compile(self) -> "ExecutionGraph":
+        """Compile captured trace into ExecutionGraph."""
+        compiler = TraceCompiler()
+        return compiler.compile(self.get_trace())
+
+
+class UniversalAgentTracer:
+    """
+    Decorator-based tracer for wrapping any agent function.
+
+    Usage:
+        tracer = UniversalAgentTracer()
+
+        @tracer.trace_llm
+        def llm_call(prompt):
+            return openai.ChatCompletion.create(prompt=prompt)
+
+        @tracer.trace_tool("diagnose")
+        def diagnose(symptoms):
+            return run_diagnosis(symptoms)
+
+        @tracer.trace_branch("critical_check")
+        def check_critical(result):
+            return result == "CRITICAL"
+
+        # Run agent
+        result = my_agent("chest pain")
+
+        # Analyze
+        graph = tracer.compile()
+        ir = AgentIR(graph)
+    """
+
+    def __init__(self):
+        self.capture = TraceCapture()
+        self._last_branch = None
+        self._last_tool = None
+        self._branches = {}
+
+    def trace_llm(self, prompt_template: str = None):
+        """Decorator to trace LLM calls."""
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                prompt = prompt_template or f"{func.__name__}({args}, {kwargs})"
+                result = func(*args, **kwargs)
+                self.capture.record_llm(prompt=prompt, output=str(result))
+                return result
+            return wrapper
+        return decorator
+
+    def trace_tool(self, name: str):
+        """Decorator to trace tool calls."""
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                result = func(*args, **kwargs)
+                self._last_tool = self.capture.record_tool(
+                    name=name,
+                    args={"args": str(args), "kwargs": str(kwargs)},
+                    result=result
+                )
+                return result
+            return wrapper
+        return decorator
+
+    def trace_branch(self, condition_desc: str = None):
+        """Decorator to trace conditional branches."""
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                result = func(*args, **kwargs)
+                branch_id = self.capture.record_branch(
+                    condition=condition_desc or f"{func.__name__}({args})",
+                    value=bool(result)
+                )
+                self._branches[condition_desc or func.__name__] = branch_id
+                self._last_branch = branch_id
+                return result
+            return wrapper
+        return decorator
+
+    def compile(self) -> "ExecutionGraph":
+        """Compile trace to ExecutionGraph."""
+        return self.capture.compile()
+
+    def get_last_branch(self) -> str:
+        """Get the last branch node ID."""
+        return self._last_branch
+
+
+def demo_universal_agent_tracer():
+    """Demo: Universal agent tracer with explicit MERGE nodes.
+
+    This demonstrates the architecture:
+    - MERGE nodes are EXPLICIT (not guessed)
+    - Both branches write to SAME variable (R_action)
+    - Phi functions only at MERGE nodes
+    """
+    print("=" * 70)
+    print("Universal Agent Tracer - Explicit MERGE Architecture")
+    print("=" * 70)
+
+    # Proper trace with EXPLICIT MERGE node
+    # Both branches write to SAME variable (R_action)
+    trace = {
+        "steps": [
+            {"id": "s1", "type": "llm", "prompt": "Patient chest pain", "output": "CRITICAL"},
+            {"id": "s2", "type": "branch", "condition": "severity == CRITICAL", "value": True,
+             "true_branch": "s3", "false_branch": "s4", "merge": "s5"},  # EXPLICIT merge binding
+            {"id": "s3", "type": "tool", "name": "emergency", "args": {}, "result": "CALL 911", "output_var": "R_action"},
+            {"id": "s4", "type": "tool", "name": "rest", "args": {}, "result": "REST", "output_var": "R_action"},
+            {"id": "s5", "type": "merge"},  # MERGE belongs to branch s2
+            {"id": "s6", "type": "output", "var": "final", "value": "DONE"},
+        ]
+    }
+
+    print("\n[1] Compiling trace with explicit MERGE...")
+    compiler = TraceCompiler()
+    graph = compiler.compile(trace)
+    print(f"    Nodes: {list(graph.nodes.keys())}")
+
+    graph.build_cfg()
+    print(f"    CFG merge points: {len([n for n, b in graph.cfg.blocks.items() if len(b.predecessors) > 1])}")
+
+    print("\n[2] Causal Analysis...")
+    ir = AgentIR(graph)
+
+    # Find branch node
+    branch_nodes = [n for n in graph.nodes if graph.nodes[n].op in ("BR", "BRANCH")]
+    if branch_nodes:
+        branch_node = branch_nodes[0]
+        print(f"\n    Branch node: {branch_node}")
+
+        why = ir.why(branch_node)
+        print(f"\n    WHY:")
+        print(f"      Condition: {why.get('condition_var')} = {why.get('condition_value')}")
+        print(f"      Selected: {why.get('selected_tool')}")
+        print(f"      Options: {why.get('options')}")
+
+        cf = ir.why_counterfactual(branch_node)
+        print(f"\n    COUNTERFACTUAL:")
+        print(f"      Factual: {cf.get('factual', {}).get('outcome')}")
+        print(f"      Counterfactual: {cf.get('counterfactual', {}).get('outcome')}")
+        print(f"      Would change: {cf.get('counterfactual', {}).get('would_change_output')}")
+
+        mc = ir.minimal_causes('R_action')
+        print(f"\n    MINIMAL CAUSES:")
+        print(f"      Factual: {mc.get('factual_value')}")
+        print(f"      Causes: {len(mc.get('minimal_causes', []))}")
+        for c in mc.get('minimal_causes', []):
+            print(f"        - {c.get('node')}: {c.get('selected_tool')} → flip to {c.get('alternative_tool')}")
+
+        print(f"\n    EXPLANATION:")
+        print(ir.explain_counterfactual(branch_node))
+
+    print("\n" + "=" * 70)
+
+    print("\n[3] Causal Analysis...")
+    ir = AgentIR(graph)
+
+    # Find branch node
+    branch_nodes = [n for n in graph.nodes if graph.nodes[n].op in ("BR", "BRANCH")]
+    if branch_nodes:
+        branch_node = branch_nodes[0]
+        print(f"\n    Branch node: {branch_node}")
+
+        why = ir.why(branch_node)
+        if "error" not in why:
+            print(f"\n    WHY analysis:")
+            print(f"      Condition: {why.get('condition_var')} = {why.get('condition_value')}")
+            print(f"      Selected tool: {why.get('selected_tool')}")
+            print(f"      Options: {why.get('options')}")
+
+            cf = ir.why_counterfactual(branch_node)
+            print(f"\n    COUNTERFACTUAL:")
+            print(f"      Factual: {cf.get('factual', {}).get('outcome')}")
+            print(f"      Counterfactual: {cf.get('counterfactual', {}).get('outcome')}")
+            print(f"      Would change: {cf.get('counterfactual', {}).get('would_change_output')}")
+
+            mc = ir.minimal_causes('action')
+            print(f"\n    MINIMAL CAUSES:")
+            print(f"      Factual value: {mc.get('factual_value')}")
+            print(f"      Causes: {len(mc.get('minimal_causes', []))}")
+            for c in mc.get('minimal_causes', []):
+                print(f"        - {c.get('node')}: flip to {c.get('alternative_tool')} would change output")
+
+            print(f"\n    EXPLANATION:")
+            print(ir.explain_counterfactual(branch_node))
+        else:
+            print(f"    Error: {why['error']}")
+
+    print("\n" + "=" * 70)
+
+
+def demo_trace_compiler():
+    """Demonstrate TraceCompiler with a real agent trace."""
+    print("=" * 70)
+    print("TraceCompiler - Real Agent Trace → ExecutionGraph")
+    print("=" * 70)
+
+    # Example: A real agent trace with tool selection
+    trace = {
+        "steps": [
+            {
+                "id": "s1",
+                "type": "llm",
+                "prompt": "User: What's 2+2?",
+                "output": "Let me calculate that."
+            },
+            {
+                "id": "s2",
+                "type": "tool",
+                "name": "calculator",
+                "args": {"expr": "2+2"},
+                "result": "4",
+                "output_var": "calc_result"
+            },
+            {
+                "id": "s3",
+                "type": "branch",
+                "condition": "result_is_numeric",
+                "value": True,
+                "true_branch": "s5",
+                "false_branch": "s4",
+                "merge": "s5"
+            },
+            {
+                "id": "s4",
+                "type": "tool",
+                "name": "search",
+                "args": {"query": "2+2"},
+                "result": "Search result: 4"
+            },
+            {
+                "id": "s5",
+                "type": "merge",
+            },
+            {
+                "id": "s6",
+                "type": "output",
+                "var": "final_answer",
+                "value": "4"
+            }
+        ]
+    }
+
+    compiler = TraceCompiler()
+    graph = compiler.compile(trace)
+
+    print(f"\n[1] Compiled trace into ExecutionGraph")
+    print(f"    Nodes: {len(graph.nodes)}")
+    for node_id, instr in graph.nodes.items():
+        print(f"    {node_id}: {instr.op} {instr.args} -> {instr.next}")
+
+    # Build CFG
+    graph.build_cfg()
+
+    # Wrap with AgentIR
+    exog = ExogenousModel()
+    agent = AgentIR(graph, exogenous=exog)
+
+    print(f"\n[2] Agent Decision Graph")
+    print(agent.explain())
+
+    print("\n" + "=" * 70)
 
 
 # ============================================================
