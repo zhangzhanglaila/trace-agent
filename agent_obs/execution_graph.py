@@ -3921,7 +3921,8 @@ class TraceCapture:
         }
 
     def record_llm(self, prompt: str, output: str = None,
-                   metadata: Dict = None, step_id: str = None) -> str:
+                   metadata: Dict = None, step_id: str = None,
+                   parent_id: str = None) -> str:
         """Record an LLM call with timing."""
         if step_id is None:
             step_id = f"llm_{self.step_index}"
@@ -3932,13 +3933,15 @@ class TraceCapture:
             "type": "llm", "id": step_id,
             "prompt": prompt, "output": output or "",
             "metadata": metadata or {},
+            "parent_id": parent_id,
             **obs
         })
         return step_id
 
     def record_tool(self, name: str, args: Dict = None, result: Any = None,
                     metadata: Dict = None, status: str = "success",
-                    error: str = None, step_id: str = None) -> str:
+                    error: str = None, step_id: str = None,
+                    parent_id: str = None) -> str:
         """Record a tool call with timing."""
         if step_id is None:
             step_id = f"tool_{self.step_index}"
@@ -3949,6 +3952,7 @@ class TraceCapture:
             "type": "tool", "id": step_id,
             "name": name, "args": args or {}, "result": result,
             "metadata": metadata or {},
+            "parent_id": parent_id,
             **obs
         })
         return step_id
@@ -3989,17 +3993,20 @@ class TraceCapture:
         return step_id
 
     def record_output(self, var: str, value: Any,
-                      metadata: Dict = None, step_id: str = None) -> str:
+                      metadata: Dict = None, step_id: str = None,
+                      status: str = "success", error: str = None,
+                      parent_id: str = None) -> str:
         """Record final output with timing."""
         if step_id is None:
             step_id = f"output_{self.step_index}"
         self.step_index += 1
         self._step_start(step_id)
-        obs = self._step_end(step_id)
+        obs = self._step_end(step_id, status, error)
         self.steps.append({
             "type": "output", "id": step_id,
             "var": var, "value": value,
             "metadata": metadata or {},
+            "parent_id": parent_id,
             **obs
         })
         return step_id

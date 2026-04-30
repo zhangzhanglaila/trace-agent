@@ -77,6 +77,47 @@ class TraceExport:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False, default=str)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TraceExport":
+        """Deserialize from a dict (reverse of to_dict)."""
+        export = cls(
+            trace_id=data.get("trace_id", ""),
+            start_time=data.get("start_time"),
+            end_time=data.get("end_time"),
+            total_latency_ms=data.get("total_latency_ms"),
+            branches=data.get("branches", []),
+        )
+        for rd in data.get("runs", []):
+            run = TraceRun(
+                id=rd.get("id", ""),
+                name=rd.get("name", ""),
+                run_type=rd.get("run_type", "chain"),
+                inputs=rd.get("inputs", {}),
+                outputs=rd.get("outputs", {}),
+                parent_run_id=rd.get("parent_run_id"),
+                trace_id=rd.get("trace_id"),
+                start_time=rd.get("start_time"),
+                end_time=rd.get("end_time"),
+                latency_ms=rd.get("latency_ms"),
+                status=rd.get("status", "success"),
+                error=rd.get("error"),
+                branch_info=rd.get("branch_info"),
+                tags=rd.get("tags", []),
+            )
+            export.runs.append(run)
+        return export
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "TraceExport":
+        """Deserialize from a JSON string."""
+        return cls.from_dict(json.loads(json_str))
+
+    @classmethod
+    def from_file(cls, path: str) -> "TraceExport":
+        """Deserialize from a JSON file."""
+        with open(path, "r", encoding="utf-8") as f:
+            return cls.from_json(f.read())
+
 
 class TraceExporter:
     """
@@ -158,10 +199,11 @@ class TraceExporter:
         """
         Compute parent_run_id for each step.
 
-        Rules:
+        Rules (in priority order):
+        - Explicit parent_id from step data (set by TraceContext span stack)
         - First step: parent = None (root)
         - Branch targets: parent = branch step_id
-        - Merge nodes: parent = branch step_id (the branch that merges here)
+        - Merge nodes: parent = branch step_id
         - Otherwise: parent = previous sequential step
         """
         parents: Dict[str, Optional[str]] = {}
@@ -187,20 +229,22 @@ class TraceExporter:
 
         for i, step in enumerate(self.steps):
             sid = step.get("id", "")
+
+            # Priority 1: Explicit parent_id from span context
+            explicit_parent = step.get("parent_id")
+            if explicit_parent is not None:
+                parents[sid] = explicit_parent if explicit_parent != "" else None
+                continue
+
             if i == 0:
                 parents[sid] = None
                 continue
 
             if sid in branch_targets:
-                # Branch target — parent is the branch step
                 parents[sid] = branch_targets[sid]
             elif sid in merge_to_branch:
-                # Merge — parent is the branch that merges here
-                # But if the merge is ALSO the previous sequential step's next, it's ambiguous
-                # Default: parent = the branch step
                 parents[sid] = merge_to_branch[sid]
             else:
-                # Sequential — parent is the previous step
                 prev_sid = self.steps[i - 1].get("id", "")
                 parents[sid] = prev_sid
 
@@ -213,15 +257,19 @@ class TraceExporter:
         sid = step.get("id", "")
         step_type = step.get("type", "chain")
 
-        # Determine run_type
-        run_type_map = {
-            "llm": "llm",
-            "tool": "tool",
-            "branch": "chain",
-            "merge": "chain",
-            "output": "chain",
-        }
-        run_type = run_type_map.get(step_type, "chain")
+        # Determine run_type — prefer semantic_type if set
+        sem_type = step.get("semantic_type")
+        if sem_type:
+            run_type = sem_type.lower()
+        else:
+            run_type_map = {
+                "llm": "llm",
+                "tool": "tool",
+                "branch": "chain",
+                "merge": "chain",
+                "output": "chain",
+            }
+            run_type = run_type_map.get(step_type, "chain")
 
         # Build inputs/outputs
         inputs, outputs = self._extract_io(step, step_type, instr)
@@ -303,7 +351,10 @@ class TraceExporter:
         return inputs, outputs
 
     def _build_name(self, step: Dict, step_type: str, instr) -> str:
-        """Build a human-readable name for the step."""
+        """Build a human-readable name for the step. Prefer semantic_name if set."""
+        sem_name = step.get("semantic_name")
+        if sem_name:
+            return sem_name
         if step_type == "llm":
             prompt = step.get("prompt", "")
             return f"LLM: {prompt[:60]}"
@@ -313,7 +364,7 @@ class TraceExporter:
         elif step_type == "branch":
             cond = step.get("condition", "?")
             val = step.get("value")
-            return f"Branch: {cond}={val}"
+            return f"[Decision] {cond}={val}"
         elif step_type == "merge":
             return "Merge"
         elif step_type == "output":

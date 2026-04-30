@@ -1,16 +1,22 @@
 """
-Trace Diff Demo: Contrast two agent runs and pinpoint the decision that caused divergence.
+Trace Diff Demo: Three contrasting cases that show the value of semantic diff.
 
 Usage:
-    python examples/diff_demo.py
+    python examples/diff_demo.py              # All 3 cases
+    python examples/diff_demo.py --json       # + JSON output
+    python examples/diff_demo.py --trees      # + individual trace trees
 
-This demonstrates the killer feature:
-    Not "what happened" — that's LangSmith.
-    But "WHY did this run differ from that one?" — that's AgentTrace.
+Three cases in one screen:
+    Case 1: Same input -> same output (no diff)
+    Case 2: Different city -> branch changes -> output diverges
+    Case 3: Tool error -> error status propagates -> fallback fails
+
+This is the product demo. One command, three stories.
 """
 import sys
 import os
 import time
+import re
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -21,7 +27,7 @@ from agent_obs.trace_diff import TraceDiffer, render_diff
 
 
 # ============================================================
-# Tools (same as real_agent_demo)
+# Tools
 # ============================================================
 
 def tool_calculator(expr: str) -> str:
@@ -47,23 +53,25 @@ def tool_search(query: str) -> str:
 
 
 # ============================================================
-# Agent (same structure as real_agent_demo)
+# Agent
 # ============================================================
 
-def run_query_agent(query: str, capture: TraceCapture) -> str:
-    """Run the agent: think → call tool → branch on result → maybe fallback → merge → output."""
+def run_agent(query: str, capture: TraceCapture) -> str:
+    """Run agent: think -> call tool -> branch on result -> maybe fallback -> merge -> output."""
     q = query.lower()
 
     capture.record_llm(prompt=query, output="Let me handle this...")
     time.sleep(0.002)
 
-    # Decide which tool
-    if "math" in q or "calculate" in q or "2+2" in q:
+    # Decide which tool and extract args from query
+    if "calculate" in q or re.search(r'[\d+\-*/]', q):
         tool_name = "calculator"
-        tool_args = {"expr": "2+2"}
+        # Extract expression
+        expr_match = re.search(r'([\d\s+\-*/.()]+)$', query)
+        expr = expr_match.group(1).strip() if expr_match else "2+2"
+        tool_args = {"expr": expr}
     elif "weather" in q:
         tool_name = "weather"
-        # Extract city from query
         city = "paris"
         for c in ["paris", "tokyo", "london", "mars", "moon"]:
             if c in q:
@@ -77,10 +85,15 @@ def run_query_agent(query: str, capture: TraceCapture) -> str:
     # Call tool
     tools = {"calculator": tool_calculator, "weather": tool_weather, "search": tool_search}
     tool_result = tools[tool_name](**tool_args)
-    capture.record_tool(name=tool_name, args=tool_args, result=tool_result)
+    is_error = "Error" in tool_result
+    capture.record_tool(
+        name=tool_name, args=tool_args, result=tool_result,
+        status="error" if is_error else "success",
+        error=tool_result if is_error else None,
+    )
     time.sleep(0.005)
 
-    # Branch
+    # Branch: is result sufficient?
     is_good = tool_result and "Error" not in tool_result and "No " not in tool_result
     capture.record_branch(
         condition="result_sufficient",
@@ -92,26 +105,33 @@ def run_query_agent(query: str, capture: TraceCapture) -> str:
 
     if not is_good:
         fb_result = tool_search(query)
-        capture.record_tool(name="search", args={"query": query}, result=fb_result,
-                           status="success" if "No " not in fb_result else "error",
-                           error=fb_result if "No " in fb_result else None,
-                           step_id="tool_fallback")
+        is_fb_error = "No " in fb_result or "Error" in fb_result
+        capture.record_tool(
+            name="search", args={"query": query}, result=fb_result,
+            status="error" if is_fb_error else "success",
+            error=fb_result if is_fb_error else None,
+            step_id="tool_fallback",
+        )
         tool_result = fb_result
 
     capture.record_merge(step_id="merge_final")
-    capture.record_output(var="final_answer", value=tool_result, step_id="output_final")
+    is_final_error = "No " in str(tool_result) or "Error" in str(tool_result)
+    capture.record_output(
+        var="final_answer", value=tool_result, step_id="output_final",
+        status="error" if is_final_error else "success",
+    )
 
     return str(tool_result)
 
 
 # ============================================================
-# Pipeline: run agent → compile → export
+# Pipeline
 # ============================================================
 
-def run_and_export(label: str, query: str):
-    """Run one agent session and produce a TraceExport."""
+def run_and_export(query: str):
+    """Run one agent session -> compile -> export."""
     capture = TraceCapture()
-    result = run_query_agent(query, capture)
+    result = run_agent(query, capture)
 
     compiler = TraceCompiler()
     graph = compiler.compile(capture.get_trace())
@@ -122,10 +142,37 @@ def run_and_export(label: str, query: str):
         step_to_node=compiler.step_to_node,
         steps=capture.steps,
     )
-    export = exporter.export()
+    return exporter.export(), result
 
-    print(f"  [{label}] query='{query}' → result='{result[:60]}'")
-    return export
+
+def print_case_header(num: int, title: str, description: str):
+    """Print a case header."""
+    print()
+    print("  " + "=" * 54)
+    print(f"  CASE {num}: {title}")
+    print(f"  {description}")
+    print("  " + "=" * 54)
+
+
+def run_case(num: int, title: str, description: str,
+             query_a: str, query_b: str):
+    """Run a single diff case: two agents, diff, render."""
+    print_case_header(num, title, description)
+
+    print(f"\n  [Run A] {query_a}")
+    export_a, result_a = run_and_export(query_a)
+    print(f"      -> {result_a[:70]}")
+
+    print(f"  [Run B] {query_b}")
+    export_b, result_b = run_and_export(query_b)
+    print(f"      -> {result_b[:70]}")
+
+    differ = TraceDiffer(export_a, export_b)
+    diff_result = differ.diff()
+
+    print(render_diff(diff_result))
+
+    return diff_result
 
 
 # ============================================================
@@ -133,34 +180,56 @@ def run_and_export(label: str, query: str):
 # ============================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  AgentTrace — Semantic Trace Diff")
-    print("  \"Why did this run differ from that one?\"")
-    print("=" * 60)
+    print("=" * 58)
+    print("  AgentTrace - Semantic Trace Diff")
+    print('  "Why did my agent behave differently?"')
+    print("=" * 58)
+    print()
+    print("  Comparing agent runs to find the ROOT CAUSE of divergence.")
+    print("  Not what happened - but WHY it happened.")
 
-    # ── Run A: Valid city → tool succeeds → true path → direct output ──
-    print("\n[1] Running two agents...")
-    export_a = run_and_export("Run A", "weather in paris")
+    results = []
 
-    # ── Run B: Unknown city → tool fails → false path → fallback search ──
-    export_b = run_and_export("Run B", "weather in mars")
+    # ── Case 1: No difference ──
+    results.append(run_case(
+        num=1,
+        title="No Difference",
+        description="Same query, same path, same result.",
+        query_a="weather in paris",
+        query_b="weather in paris",
+    ))
 
-    # ── Diff ──
-    differ = TraceDiffer(export_a, export_b)
-    diff_result = differ.diff()
+    # ── Case 2: Branch change ──
+    results.append(run_case(
+        num=2,
+        title="Branch Change",
+        description="Different city -> condition flips -> new path.",
+        query_a="weather in paris",
+        query_b="weather in mars",
+    ))
 
-    # ── Render ──
-    print(render_diff(diff_result))
+    # ── Case 3: Error path ──
+    results.append(run_case(
+        num=3,
+        title="Error Path",
+        description="Tool returns error -> fallback also fails -> error propagates.",
+        query_a="calculate: 2+2",
+        query_b="calculate: 1/0",
+    ))
 
-    # ── Also show individual trace trees (optional, for context) ──
-    show_trees = "--trees" in sys.argv
-    if show_trees:
-        print("\n  Run A Tree:")
-        TraceViewer(export_a).print("tree")
-        print("\n  Run B Tree:")
-        TraceViewer(export_b).print("tree")
+    # ── Summary ──
+    print()
+    print("  " + "=" * 54)
+    print("  ALL 3 CASES COMPLETE")
+    print("  " + "=" * 54)
+    print(f"  Case 1: {'No divergence' if not results[0].has_diverged else 'HAS DIVERGENCE'}")
+    print(f"  Case 2: {'Diverged at: ' + results[1].first_divergence.id if results[1].first_divergence else 'No divergence'}")
+    print(f"  Case 3: {'Diverged at: ' + results[2].first_divergence.id if results[2].first_divergence else 'No divergence'}")
 
-    # ── JSON output ──
+    # ── Optionals ──
+    if "--trees" in sys.argv:
+        print("\n  TIP: re-run with --trees to see individual trace trees")
+
     if "--json" in sys.argv:
-        print("\n  JSON:")
-        print(diff_result.to_json())
+        print("\n  [JSON Export - Case 2]")
+        print(results[1].to_json())

@@ -1,0 +1,101 @@
+{
+  "trace_id": "trace_1777522883589",
+  "start_time": 1777522883.5890145,
+  "end_time": 1777522883.5890145,
+  "total_latency_ms": 0.0,
+  "runs": [
+    {
+      "id": "chain_1",
+      "name": "[CHAIN] TestAgent2",
+      "run_type": "chain",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": null,
+      "start_time": 1777522883.5890145,
+      "end_time": 1777522883.5890145,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    },
+    {
+      "id": "input_2",
+      "name": "[INPUT] input",
+      "run_type": "input",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777522883.5890145,
+      "end_time": 1777522883.5890145,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    },
+    {
+      "id": "llm_3",
+      "name": "[LLM] classify_intent",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": "weather in paris"
+      },
+      "outputs": {
+        "result": "weather"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777522883.5890145,
+      "end_time": 1777522883.5890145,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "tool_4",
+      "name": "[TOOL] weather",
+      "run_type": "tool",
+      "inputs": {
+        "tool": "weather",
+        "args": {
+          "args": "('paris',)"
+        }
+      },
+      "outputs": {
+        "result": "Paris: 18C, cloudy"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777522883.5890145,
+      "end_time": 1777522883.5890145,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "tool"
+      ]
+    },
+    {
+      "id": "output_5",
+      "name": "[OUTPUT] output",
+      "run_type": "output",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777522883.5890145,
+      "end_time": 1777522883.5890145,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    }
+  ],
+  "branches": []
+}

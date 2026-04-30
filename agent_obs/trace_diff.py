@@ -56,18 +56,27 @@ class FirstDivergence:
 class TraceDiffResult:
     trace_id_a: str
     trace_id_b: str
+    summary: str = ""                                      # One-line human explanation
     branch_diffs: List[BranchDiff] = field(default_factory=list)
     step_diffs: List[StepDiff] = field(default_factory=list)
     first_divergence: Optional[FirstDivergence] = None
-    run_a_path: List[str] = field(default_factory=list)    # Human-readable path summary
+    run_a_path: List[str] = field(default_factory=list)
     run_b_path: List[str] = field(default_factory=list)
     output_diverged: bool = False
+    has_diverged: bool = False
+    output_a: Any = None
+    output_b: Any = None
+    causal_chain: List[str] = field(default_factory=list)   # Root-cause chain of step names
+    causal_narrative: str = ""                                # Full explain_diff() narrative
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "trace_id_a": self.trace_id_a,
             "trace_id_b": self.trace_id_b,
+            "summary": self.summary,
             "output_diverged": self.output_diverged,
+            "output_a": self.output_a,
+            "output_b": self.output_b,
             "run_a_path": self.run_a_path,
             "run_b_path": self.run_b_path,
             "branch_diffs": [],
@@ -162,8 +171,19 @@ class TraceDiffer:
         result.run_a_path = self._build_path_summary(self.a)
         result.run_b_path = self._build_path_summary(self.b)
 
-        # 5. Check output divergence
-        result.output_diverged = self._check_output_diverged()
+        # 5. Check output divergence and capture output values
+        result.output_a = self._get_final_output(self.a)
+        result.output_b = self._get_final_output(self.b)
+        result.output_diverged = result.output_a != result.output_b
+
+        # 6. Overall divergence flag
+        result.has_diverged = (
+            any(bd.diverged for bd in result.branch_diffs) or
+            any(sd.diverged for sd in result.step_diffs)
+        )
+
+        # 7. Generate one-line human summary
+        result.summary = self._build_summary(result)
 
         return result
 
@@ -291,8 +311,8 @@ class TraceDiffer:
                     type="step",
                     id=sd.step_name,
                     description=f"Step '{sd.step_name}' only exists in {sd.only_in}",
-                    run_a="present" if sd.only_in != "run_a" else "absent",
-                    run_b="present" if sd.only_in != "run_b" else "absent",
+                    run_a="present" if sd.only_in == "run_a" else "absent",
+                    run_b="present" if sd.only_in == "run_b" else "absent",
                 )
 
         # 3. No divergence
@@ -361,18 +381,102 @@ class TraceDiffer:
                 path.append("llm")
         return path
 
-    def _check_output_diverged(self) -> bool:
-        """Check if the final outputs differ between the two traces."""
-        out_a = self._get_final_output(self.a)
-        out_b = self._get_final_output(self.b)
-        return out_a != out_b
+    def _build_summary(self, result: TraceDiffResult) -> str:
+        """
+        Generate a one-line human-readable explanation of WHY the runs differ.
+
+        Rules:
+        - Must name the decision that changed
+        - Must say what path change it caused
+        - Must state the final impact
+        """
+        if not result.has_diverged:
+            return "Both runs followed identical paths and produced the same result."
+
+        fd = result.first_divergence
+        if fd is None:
+            return "The runs differ, but no specific divergence point was identified."
+
+        if fd.type == "branch":
+            # The output changed because `cond` evaluated to X instead of Y
+            cond = fd.id
+            val_a = fd.run_a
+            val_b = fd.run_b
+            a_desc = self._describe_path_change(result)
+
+            if result.output_diverged:
+                return (
+                    f"The output changed because `{cond}` "
+                    f"evaluated to {val_b} instead of {val_a}, "
+                    f"{a_desc}."
+                )
+            else:
+                return (
+                    f"The path diverged at `{cond}` "
+                    f"({val_a} -> {val_b}), "
+                    f"but the output converged to the same result."
+                )
+
+        elif fd.type == "step":
+            name = fd.id
+            where = fd.run_a if fd.run_a == "absent" else fd.run_b
+            who = "run_a" if fd.run_a == "present" else "run_b"
+            if result.output_diverged:
+                return (
+                    f"The output changed because step `{name}` "
+                    f"only executed in {who}, causing different paths."
+                )
+            else:
+                return (
+                    f"Step `{name}` only executed in {who}, "
+                    f"but the output remained the same."
+                )
+
+        return "The runs differ."
+
+    def _describe_path_change(self, result: TraceDiffResult) -> str:
+        """Describe the path change in natural language."""
+        diverged_branches = [bd for bd in result.branch_diffs if bd.diverged]
+        if not diverged_branches:
+            return "causing different steps to execute"
+
+        bd = diverged_branches[0]
+
+        # Categorize the path change
+        if bd.run_a_path == "true" and bd.run_b_path == "false":
+            return "triggering a fallback path instead of returning early"
+        elif bd.run_a_path == "false" and bd.run_b_path == "true":
+            return "taking a direct path instead of the fallback"
+        elif bd.run_a_path == "none":
+            return f"causing a new branch path ({bd.run_b_path}) to execute"
+        elif bd.run_b_path == "none":
+            return f"skipping a branch path ({bd.run_a_path}) that previously executed"
+        else:
+            return f"switching from the {bd.run_a_path} path to the {bd.run_b_path} path"
 
     @staticmethod
     def _get_final_output(trace: TraceExport) -> Any:
         """Extract final output from a trace."""
+        # Priority 1: Explicit output step
         for run in reversed(trace.runs):
             if run.run_type == "chain" and run.name.startswith("Output:"):
-                return run.outputs.get("value")
+                val = run.outputs.get("value")
+                if val is not None:
+                    return val
+
+        # Priority 2: Last tool result (for auto-traced agents)
+        for run in reversed(trace.runs):
+            if run.run_type == "tool":
+                val = run.outputs.get("result")
+                if val is not None:
+                    return val
+
+        # Priority 3: Last run output
+        for run in reversed(trace.runs):
+            val = run.outputs.get("result") or run.outputs.get("value")
+            if val is not None:
+                return val
+
         return None
 
 
@@ -380,82 +484,115 @@ class TraceDiffer:
 # CLI Renderer
 # ============================================================
 
-def render_diff(diff: TraceDiffResult) -> str:
-    """Render diff result as a product-grade CLI output."""
+def render_diff(diff: TraceDiffResult, level: int = 2) -> str:
+    """
+    Render diff result at the requested detail level.
+
+    Level 1: Executive summary (one line)
+    Level 2: Engineer (decision + path + divergence) [default]
+    Level 3: Debug (full causal chain + step diffs)
+    """
     lines = []
-    sep = "=" * 60
+    hdr = "=" * 58
 
-    lines.append("")
-    lines.append(sep)
-    lines.append("  TRACE DIFF")
-    lines.append(sep)
-    lines.append(f"  Run A: {diff.trace_id_a}")
-    lines.append(f"  Run B: {diff.trace_id_b}")
-    lines.append("")
+    if not diff.has_diverged:
+        lines.append("")
+        lines.append(hdr)
+        lines.append("  NO DIFFERENCE")
+        lines.append(hdr)
+        lines.append(f"  {diff.summary}")
+        lines.append("")
+        return "\n".join(lines)
 
-    # ── Branch Diffs ──
-    has_diverged = any(bd.diverged for bd in diff.branch_diffs)
-    lines.append("  [BRANCH DECISIONS]")
-    lines.append("  " + "-" * 50)
-    for bd in diff.branch_diffs:
-        marker = "  [!] DIVERGED" if bd.diverged else "  = same"
-        lines.append(f"{marker} | {bd.condition}")
-        lines.append(f"         run_a: {bd.run_a_path}")
-        lines.append(f"         run_b: {bd.run_b_path}")
+    # ── Level 1: Executive ──
     lines.append("")
-
-    # ── Path Effects ──
-    lines.append("  [PATH EFFECT]")
-    lines.append("  " + "-" * 50)
-    lines.append(f"  run_a path: {' → '.join(diff.run_a_path) if diff.run_a_path else '(empty)'}")
-    lines.append(f"  run_b path: {' → '.join(diff.run_b_path) if diff.run_b_path else '(empty)'}")
+    lines.append(hdr)
+    lines.append("  ROOT CAUSE FOUND")
+    lines.append(hdr)
+    lines.append("")
+    lines.append(f"  {diff.summary}")
     lines.append("")
 
-    # ── First Divergence ──
-    lines.append("  [FIRST DIVERGENCE]")
-    lines.append("  " + "-" * 50)
-    if diff.first_divergence:
-        fd = diff.first_divergence
-        if fd.type == "none":
-            lines.append(f"  (none) — {fd.description}")
-        else:
-            lines.append(f"  type: {fd.type}")
-            lines.append(f"  at:   {fd.id}")
-            lines.append(f"  run_a: {fd.run_a}")
-            lines.append(f"  run_b: {fd.run_b}")
-            lines.append(f"  reason: {fd.description}")
+    if level < 2:
+        lines.append(hdr)
+        return "\n".join(lines)
+
+    # ── Level 2: Engineer ──
+    diverged_branches = [bd for bd in diff.branch_diffs if bd.diverged]
+    if diverged_branches:
+        lines.append("  [Decision Change]")
+        for bd in diverged_branches:
+            lines.append(f"  - {bd.condition}: {bd.run_a_path} -> {bd.run_b_path}")
+        lines.append("")
+
+    lines.append("  [Path Impact]")
+    path_a = " -> ".join(diff.run_a_path) if diff.run_a_path else "(empty)"
+    path_b = " -> ".join(diff.run_b_path) if diff.run_b_path else "(empty)"
+    lines.append(f"  run_a: {path_a}")
+    lines.append(f"  run_b: {path_b}")
     lines.append("")
 
-    # ── Impact ──
-    lines.append("  [IMPACT]")
-    lines.append("  " + "-" * 50)
+    if diff.first_divergence and diff.first_divergence.type != "none":
+        lines.append("  [First Divergence]")
+        lines.append(f"  -> {diff.first_divergence.id}")
+        lines.append("")
+
+    lines.append("  [Result]")
     if diff.output_diverged:
-        lines.append("  [!] Final output DIVERGED between runs")
-    elif has_diverged:
-        lines.append("  Path diverged but output converged (same result via different paths)")
+        out_a = _get_output_preview(diff, "a")
+        out_b = _get_output_preview(diff, "b")
+        lines.append(f"  -> Final output differs")
+        if out_a:
+            lines.append(f"     run_a: {out_a}")
+        if out_b:
+            lines.append(f"     run_b: {out_b}")
     else:
-        lines.append("  No impact — both runs produced identical results")
+        lines.append(f"  -> Output converged (same result via different paths)")
     lines.append("")
 
-    # ── Step Diffs (only show diverged) ──
+    if level < 3:
+        lines.append(hdr)
+        return "\n".join(lines)
+
+    # ── Level 3: Causal Chain ──
+    if diff.causal_narrative:
+        lines.append("  [Causal Explanation]")
+        for line in diff.causal_narrative.split("\n"):
+            if line.strip():
+                lines.append(f"  {line}")
+        lines.append("")
+    elif diff.causal_chain:
+        lines.append("  [Causal Chain]")
+        for i, step in enumerate(diff.causal_chain):
+            arrow = "  ->" if i < len(diff.causal_chain) - 1 else "  [!]"
+            lines.append(f"  {arrow} {step}")
+        lines.append("")
+
+    # ── Step Diffs (only diverged) ──
     diverged_steps = [sd for sd in diff.step_diffs if sd.diverged]
     if diverged_steps:
-        lines.append("  [STEP DIFFERENCES]")
-        lines.append("  " + "-" * 50)
+        lines.append("  [Step Deltas]")
         for sd in diverged_steps:
             if sd.only_in:
-                lines.append(f"  step '{sd.step_name}' only in {sd.only_in}")
+                lines.append(f"  - '{sd.step_name}' only in {sd.only_in}")
             else:
-                parts = [f"  step '{sd.step_name}'"]
-                if sd.run_a_status and sd.run_b_status:
-                    parts.append(f"status: {sd.run_a_status} → {sd.run_b_status}")
-                if sd.run_a_error or sd.run_b_error:
-                    parts.append(f"error: {sd.run_a_error} → {sd.run_b_error}")
+                parts = [f"  - '{sd.step_name}'"]
+                if sd.run_a_status != sd.run_b_status:
+                    parts.append(f"status: {sd.run_a_status} -> {sd.run_b_status}")
                 lines.append(" | ".join(parts))
         lines.append("")
 
-    lines.append(sep)
+    lines.append(hdr)
     return "\n".join(lines)
+
+
+def _get_output_preview(diff: TraceDiffResult, which: str) -> str:
+    """Get a short preview of the final output for display."""
+    val = diff.output_a if which == "a" else diff.output_b
+    if val is not None:
+        s = str(val)
+        return s[:80] if len(s) > 80 else s
+    return ""
 
 
 def diff_traces(trace_a: TraceExport, trace_b: TraceExport) -> TraceDiffResult:
