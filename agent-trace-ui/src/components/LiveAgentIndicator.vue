@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 
-interface AgentStatus {
-  status: string
+interface LiveAgent {
+  agent_id: string
   agent_name: string
   pid: number
-  alive: boolean
-  error?: string
+  status: string
+  timestamp: number
 }
 
-const status = ref<AgentStatus | null>(null)
+const agents = ref<LiveAgent[]>([])
 let timer: ReturnType<typeof setInterval> | null = null
 
 async function poll() {
@@ -17,14 +17,10 @@ async function poll() {
     const res = await fetch('/api/trace/agents/active')
     if (res.ok) {
       const data = await res.json()
-      if (data.status && data.status !== 'none') {
-        status.value = data as AgentStatus
-      } else {
-        status.value = null
-      }
+      agents.value = data.agents || []
     }
   } catch {
-    status.value = null
+    agents.value = []
   }
 }
 
@@ -39,27 +35,35 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="status && status.alive" class="live-indicator">
-    <span class="live-dot"></span>
-    <span class="live-text">
-      <strong>{{ status.agent_name }}</strong> is running
-      <span class="live-pid">(PID {{ status.pid }})</span>
-    </span>
-    <span class="live-hint">Open Quick Run to trace this agent</span>
+  <div v-if="agents.length > 0" class="live-indicator">
+    <div v-for="agent in agents" :key="agent.agent_id" class="live-agent-row">
+      <span class="live-dot"></span>
+      <span class="live-text">
+        <strong>{{ agent.agent_name }}</strong> is running
+        <span class="live-pid">(PID {{ agent.pid }})</span>
+      </span>
+    </div>
+    <span class="live-hint">{{ agents.length }} agent(s) connected</span>
   </div>
 </template>
 
 <style scoped>
 .live-indicator {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 4px;
   padding: 8px 16px;
   background: linear-gradient(135deg, #f0f9eb, #e1f3d8);
   border: 1px solid #b3e19d;
   border-radius: 8px;
   margin-bottom: 12px;
   font-size: 13px;
+}
+
+.live-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .live-dot {
@@ -92,8 +96,8 @@ onUnmounted(() => {
 }
 
 .live-hint {
-  font-size: 11px;
+  font-size: 10px;
   color: #909399;
-  margin-left: auto;
+  margin-top: 2px;
 }
 </style>

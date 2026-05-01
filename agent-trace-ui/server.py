@@ -34,6 +34,23 @@ from agent_obs.trace_diff import TraceDiffer
 from agent_obs.cli_main import _load_module, _find_agent, _parse_script_ref
 
 
+# ── In-memory agent registry (replaces file-based agent_status.json) ──
+# Supports multiple simultaneous agents. Agents register via HTTP POST.
+# Stale entries (no heartbeat for 30s) are auto-cleaned.
+_active_agents: dict = {}  # agent_id -> {agent_name, pid, timestamp, ...}
+_agent_lock = __import__('threading').Lock()
+
+
+def _cleanup_stale_agents(ttl: float = 30.0):
+    """Remove agents that haven't sent a heartbeat within TTL."""
+    now = time.time()
+    with _agent_lock:
+        stale = [aid for aid, d in _active_agents.items()
+                 if now - d.get("timestamp", 0) > ttl]
+        for aid in stale:
+            del _active_agents[aid]
+
+
 def build_trace(bug_enabled: bool = True) -> str:
     """Run the Travel Planner agent and return unified JSON."""
     examples_dir = str(ROOT.parent / "examples")
@@ -323,45 +340,21 @@ class TraceHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/trace/agents":
             try:
-                agents = _scan_agents()
+                extra = params.get("dir", [None])[0]
+                agents = _scan_agents(extra_dir=extra)
                 self._send_json(json.dumps({"agents": agents}))
             except Exception as e:
                 self._send_json(json.dumps({"error": str(e)}), 500)
 
         elif path == "/api/trace/agents/active":
             try:
-                status_file = os.path.join(os.path.dirname(__file__), "public", "agent_status.json")
-                if os.path.exists(status_file):
-                    with open(status_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    pid = data.get("pid", 0)
-                    ts = data.get("timestamp", 0)
-                    # Cross-platform liveness check:
-                    # 1. Try os.kill(pid, 0) on Unix
-                    # 2. Fall back to timestamp freshness (30s window)
-                    alive = False
-                    try:
-                        os.kill(pid, 0)
-                        alive = True
-                    except (OSError, TypeError, ValueError):
-                        # os.kill(pid, 0) not available (Windows) or invalid pid
-                        # Use timestamp freshness as fallback
-                        if time.time() - ts < 30:
-                            alive = True
-                    if not alive and time.time() - ts > 30:
-                        # Stale file — clean it up
-                        try:
-                            os.remove(status_file)
-                        except OSError:
-                            pass
-                        self._send_json(json.dumps({"status": "none"}))
-                        return
-                    data["alive"] = alive
-                    if not alive:
-                        data["status"] = "exited"
-                    self._send_json(json.dumps(data))
-                else:
-                    self._send_json(json.dumps({"status": "none"}))
+                _cleanup_stale_agents()
+                with _agent_lock:
+                    agents_list = [
+                        {"agent_id": aid, **{k: v for k, v in d.items()}}
+                        for aid, d in _active_agents.items()
+                    ]
+                self._send_json(json.dumps({"agents": agents_list}))
             except Exception as e:
                 self._send_json(json.dumps({"error": str(e)}), 500)
 
@@ -383,7 +376,28 @@ class TraceHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/api/trace/what-if":
+        if path == "/api/trace/agents/register":
+            body = self._read_body()
+            agent_id = body.get("agent_id", f"agent_{body.get('pid', 'unknown')}")
+            agent_name = body.get("agent_name", "Unknown")
+            pid = body.get("pid", 0)
+            with _agent_lock:
+                _active_agents[agent_id] = {
+                    "agent_name": agent_name,
+                    "pid": pid,
+                    "timestamp": time.time(),
+                    "status": "running",
+                }
+            self._send_json(json.dumps({"ok": True, "agent_id": agent_id}))
+
+        elif path == "/api/trace/agents/unregister":
+            body = self._read_body()
+            agent_id = body.get("agent_id", "")
+            with _agent_lock:
+                _active_agents.pop(agent_id, None)
+            self._send_json(json.dumps({"ok": True}))
+
+        elif path == "/api/trace/what-if":
             try:
                 self._send_json(build_what_if())
             except Exception as e:
@@ -450,48 +464,99 @@ def _list_traces() -> list:
     return traces
 
 
-def _scan_agents(scan_dir: str = None) -> list:
-    """Scan a directory for Python files that look like agent scripts.
+# Extra directories to scan for agents (set via CLI --project-dir)
+_extra_scan_dirs: list = []
 
-    Returns a list of {path, name, entry} candidates for the Agent Path field.
+
+def _collect_scan_dirs(extra_dir: str = None) -> list:
+    """Collect all directories to scan for agent discovery.
+
+    Priority order:
+      1. AGENTTRACE_PROJECT_DIR env var
+      2. CLI --project-dir args
+      3. Current working directory
+      4. AgentTrace project root (for built-in examples)
+      5. extra_dir (from ?dir= query param or explicit argument)
+    """
+    dirs = []
+    env_dir = os.environ.get("AGENTTRACE_PROJECT_DIR")
+    if env_dir and os.path.isdir(env_dir):
+        dirs.append(os.path.abspath(env_dir))
+    for d in _extra_scan_dirs:
+        d = os.path.abspath(d)
+        if os.path.isdir(d) and d not in dirs:
+            dirs.append(d)
+    cwd = os.getcwd()
+    if cwd not in dirs:
+        dirs.append(cwd)
+    project_root = str(ROOT.parent)
+    if project_root not in dirs:
+        dirs.append(project_root)
+    if extra_dir and os.path.isdir(extra_dir):
+        extra_dir = os.path.abspath(extra_dir)
+        if extra_dir not in dirs:
+            dirs.append(extra_dir)
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _scan_agents(scan_dirs=None, extra_dir=None) -> list:
+    """Scan directories for Python files that look like agent scripts.
+
+    Args:
+        scan_dirs: List of directories to scan. If None, auto-discovers via
+                   _collect_scan_dirs().
+        extra_dir: Additional directory to append to the scan list.
+
+    Returns a list of {id, path, name, entry} candidates.
     """
     import re
-    if not scan_dir:
-        scan_dir = str(ROOT.parent)
+    if scan_dirs is None:
+        scan_dirs = _collect_scan_dirs(extra_dir)
+    elif isinstance(scan_dirs, str):
+        scan_dirs = [scan_dirs]
+    if extra_dir and os.path.isdir(extra_dir):
+        extra_dir = os.path.abspath(extra_dir)
+        if extra_dir not in scan_dirs:
+            scan_dirs = list(scan_dirs) + [extra_dir]
+
     candidates = []
-    for root, dirs, files in os.walk(scan_dir):
-        # Skip hidden, venv, node_modules, __pycache__, .git
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
-                    ("venv", "node_modules", "__pycache__", "dist", ".git")]
-        for f in files:
-            if not f.endswith(".py") or f.startswith("_"):
-                continue
-            fpath = os.path.join(root, f)
-            try:
-                with open(fpath, "r", encoding="utf-8") as fh:
-                    content = fh.read()
-            except (OSError, UnicodeDecodeError):
-                continue
-            rel = os.path.relpath(fpath, scan_dir).replace("\\", "/")
-            # Look for agent-like patterns
-            has_agent_run = bool(re.search(r'def\s+run\s*\(', content))
-            has_agent_class = bool(re.search(r'class\s+(\w*[Aa]gent\w*)', content))
-            has_agent_var = bool(re.search(r'^\s*agent\s*=\s*', content, re.MULTILINE))
-            if not (has_agent_class or has_agent_var):
-                continue
-            # Determine entry reference
-            entry_candidates = []
-            if has_agent_var:
-                entry_candidates.append(f"{rel}:agent")
-            for m in re.finditer(r'class\s+(\w*[Aa]gent\w*)', content):
-                cname = m.group(1)
-                entry_candidates.append(f"{rel}:{cname}")
-            for entry in entry_candidates:
-                candidates.append({
-                    "path": rel,
-                    "name": f,
-                    "entry": entry,
-                })
+    for scan_dir in scan_dirs:
+        if not os.path.isdir(scan_dir):
+            continue
+        for root, dirs, files in os.walk(scan_dir):
+            # Skip hidden, venv, node_modules, __pycache__, .git
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
+                        ("venv", "node_modules", "__pycache__", "dist", ".git")]
+            for f in files:
+                if not f.endswith(".py") or f.startswith("_"):
+                    continue
+                fpath = os.path.join(root, f)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fh:
+                        content = fh.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                rel = os.path.relpath(fpath, scan_dir).replace("\\", "/")
+                # Look for agent-like patterns
+                has_agent_class = bool(re.search(r'class\s+(\w*[Aa]gent\w*)', content))
+                has_agent_var = bool(re.search(r'^\s*agent\s*=\s*', content, re.MULTILINE))
+                if not (has_agent_class or has_agent_var):
+                    continue
+                # Determine entry reference
+                entry_candidates = []
+                if has_agent_var:
+                    entry_candidates.append(f"{rel}:agent")
+                for m in re.finditer(r'class\s+(\w*[Aa]gent\w*)', content):
+                    cname = m.group(1)
+                    entry_candidates.append(f"{rel}:{cname}")
+                for entry in entry_candidates:
+                    agent_id = entry.rsplit(":", 1)[-1] if ":" in entry else entry
+                    candidates.append({
+                        "id": agent_id,
+                        "path": rel,
+                        "name": f,
+                        "entry": entry,
+                    })
     # Deduplicate by entry
     seen = set()
     unique = []
@@ -530,7 +595,12 @@ def main():
                         help="Serve built frontend from dist/ directory")
     parser.add_argument("--no-static", action="store_true",
                         help="Disable static file serving")
+    parser.add_argument("--project-dir", action="append", default=[],
+                        help="Additional project directory to scan for agents (repeatable)")
     args = parser.parse_args()
+
+    global _extra_scan_dirs
+    _extra_scan_dirs = args.project_dir
 
     serve_static = args.static or not args.no_static
 

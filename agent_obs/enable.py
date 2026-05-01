@@ -43,46 +43,52 @@ _server_started = False
 _server_port = 8765
 _ui_dir: Optional[Path] = None
 _attached_agent_name: Optional[str] = None
+_attached_agent_id: Optional[str] = None
 
 
-def _status_file_path() -> Optional[Path]:
-    """Path to the agent status file read by the UI server."""
-    ui = _find_ui_dir()
-    if not ui:
-        return None
-    status_dir = ui / "public"
-    status_dir.mkdir(parents=True, exist_ok=True)
-    return status_dir / "agent_status.json"
+def _agent_registry_url(port: int, endpoint: str) -> str:
+    return f"http://127.0.0.1:{port}/api/trace/agents/{endpoint}"
 
 
-def _write_agent_status(status: str, agent_name: str = "", extra: dict = None):
-    """Write agent status to the shared status file."""
-    fp = _status_file_path()
-    if not fp:
-        return
-    data = {
-        "status": status,
-        "agent_name": agent_name or _attached_agent_name or "Unknown",
+def _register_agent(port: int, agent_name: str):
+    """Register this agent process with the UI server via HTTP."""
+    global _attached_agent_id
+    import urllib.request
+    agent_id = f"{agent_name or 'Agent'}_{os.getpid()}"
+    _attached_agent_id = agent_id
+    data = json.dumps({
+        "agent_id": agent_id,
+        "agent_name": agent_name or "Unknown",
         "pid": os.getpid(),
-        "timestamp": time.time(),
-    }
-    if extra:
-        data.update(extra)
+    }).encode("utf-8")
     try:
-        with open(fp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except OSError:
+        req = urllib.request.Request(
+            _agent_registry_url(port, "register"),
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass  # Server may not be up yet; UI will poll when it starts
+
+
+def _unregister_agent(port: int):
+    """Unregister this agent process from the UI server."""
+    global _attached_agent_id
+    if not _attached_agent_id:
+        return
+    import urllib.request
+    data = json.dumps({"agent_id": _attached_agent_id}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            _agent_registry_url(port, "unregister"),
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
         pass
-
-
-def _clear_agent_status():
-    """Remove the status file on agent exit."""
-    fp = _status_file_path()
-    if fp and fp.exists():
-        try:
-            fp.unlink()
-        except OSError:
-            pass
+    _attached_agent_id = None
 
 
 def enable(ui: bool = False, port: int = 8765, auto_attach: bool = False,
@@ -95,6 +101,7 @@ def enable(ui: bool = False, port: int = 8765, auto_attach: bool = False,
 
     With auto_attach=True, the UI server detects your agent process and
     shows it as "Connected" — like Chrome DevTools for your agent.
+    Supports multiple simultaneous agents.
 
     Args:
         ui: If True, start the debug UI server and open browser.
@@ -118,8 +125,8 @@ def enable(ui: bool = False, port: int = 8765, auto_attach: bool = False,
     os.environ["AGENTTRACE_PORT"] = str(port)
 
     if auto_attach:
-        _write_agent_status("running", agent_name)
-        atexit.register(_clear_agent_status)
+        _register_agent(port, agent_name)
+        atexit.register(_unregister_agent, port)
 
     if ui or auto_attach:
         _launch_ui(port)
@@ -268,13 +275,18 @@ def _run_server(port: int):
         print(f"  [WARN] server.py not found at {server_py}")
         return
 
-    # Run server in a subprocess (cleaner isolation)
+    cmd = [sys.executable, str(server_py), "--port", str(port)]
+
+    # Pass the user's project directory so the server discovers their agents.
+    # sys.argv[0] is the script the user ran (e.g. /home/user/my_agents/run.py).
+    if sys.argv and sys.argv[0]:
+        user_script = os.path.abspath(sys.argv[0])
+        user_project = os.path.dirname(user_script)
+        if os.path.isdir(user_project):
+            cmd.extend(["--project-dir", user_project])
+
     try:
-        subprocess.run(
-            [sys.executable, str(server_py), "--port", str(port)],
-            cwd=str(ui_dir),
-            capture_output=False,
-        )
+        subprocess.run(cmd, cwd=str(ui_dir), capture_output=False)
     except Exception as e:
         print(f"  [WARN] Server failed: {e}")
 

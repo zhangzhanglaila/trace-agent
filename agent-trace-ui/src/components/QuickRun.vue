@@ -5,6 +5,7 @@ import { useTraceStore } from '../store/traceStore'
 const store = useTraceStore()
 
 interface AgentOption {
+  id: string
   entry: string
   path: string
   name: string
@@ -18,6 +19,8 @@ const inputA = ref('Plan a trip to Tokyo for hiking')
 const inputB = ref('Plan a trip to Paris for hiking')
 const running = ref(false)
 const runError = ref<string | null>(null)
+const scanDir = ref('')
+const scanning = ref(false)
 
 const effectiveAgentPath = computed(() => {
   if (showCustomInput.value) return customPath.value.trim()
@@ -40,6 +43,20 @@ onMounted(async () => {
     }
   } catch { /* non-critical */ }
 })
+
+async function scanDirectory() {
+  scanning.value = true
+  try {
+    const dir = scanDir.value.trim()
+    const url = dir ? `/api/trace/agents?dir=${encodeURIComponent(dir)}` : '/api/trace/agents'
+    const res = await fetch(url)
+    if (res.ok) {
+      const data = await res.json()
+      agentOptions.value = data.agents || []
+    }
+  } catch { /* non-critical */ }
+  finally { scanning.value = false }
+}
 
 async function runCompare() {
   running.value = true
@@ -110,6 +127,22 @@ async function runCompare() {
           placeholder="my_agent.py:Agent"
           :disabled="running"
         />
+        <div class="qr-scan-row">
+          <input
+            v-model="scanDir"
+            type="text"
+            class="qr-input qr-input-mono qr-scan-input"
+            placeholder="Scan project dir... (e.g. /home/user/my_agents)"
+            :disabled="running || scanning"
+          />
+          <button
+            class="qr-scan-btn"
+            @click="scanDirectory"
+            :disabled="running || scanning"
+          >
+            {{ scanning ? '...' : 'Scan' }}
+          </button>
+        </div>
       </div>
 
       <div class="qr-inputs">
@@ -223,6 +256,41 @@ async function runCompare() {
 
 .qr-custom-input {
   margin-top: 6px;
+}
+
+.qr-scan-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.qr-scan-input {
+  flex: 1;
+  font-size: 11px;
+}
+
+.qr-scan-btn {
+  padding: 4px 12px;
+  border: 1px solid #e4e7ed;
+  background: #f5f7fa;
+  color: #606266;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.qr-scan-btn:hover:not(:disabled) {
+  border-color: #409EFF;
+  color: #409EFF;
+  background: #ecf5ff;
+}
+
+.qr-scan-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .qr-input-mono {

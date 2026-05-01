@@ -101,25 +101,37 @@ def _build_explanation(verdict: str, root_var: str,
                       narrative: str) -> str:
     """Build a natural language explanation from diff data."""
     if not diff.has_diverged:
-        return "Both runs produced identical outputs — no divergence detected."
+        return "Both runs followed the same path and produced consistent outputs — no issues detected."
 
-    parts = [verdict.rstrip(".") if verdict else "Run B diverged from Run A."]
+    # If narrative is short and sentence-like, use it directly
+    if narrative and len(narrative) < 300 and "\n" not in narrative.strip():
+        return narrative.strip()
 
-    if diff.first_divergence:
-        fd = diff.first_divergence
+    # Build a human-readable explanation
+    fd = diff.first_divergence
+    parts = []
+
+    if fd and fd.id:
+        step_name = fd.id.replace("_", " ").replace("route to", "routing to")
         parts.append(
-            f"The first divergence occurred at \"{fd.id}\": "
-            f"Run A used {fd.run_a}, but Run B used {fd.run_b}."
+            f"The agent diverged at the decision point \"{step_name}\": "
+            f"Run A took the \"{fd.run_a}\" path, but Run B took the \"{fd.run_b}\" path."
         )
+    else:
+        parts.append("The two runs took different execution paths.")
 
-    if root_var and var_a and var_b:
+    if root_var:
+        clean_var = root_var.replace("_", " ")
+        # Truncate long values
+        va = var_a[:60] + "..." if len(var_a) > 60 else var_a
+        vb = var_b[:60] + "..." if len(var_b) > 60 else var_b
         parts.append(
-            f"Root cause: variable `{root_var}` was `{var_a}` in Run A "
-            f"but `{var_b}` in Run B."
+            f"This was caused by `{clean_var}` differing between runs "
+            f"(Run A had {va}, Run B had {vb})."
         )
 
     if diff.output_diverged:
-        parts.append("This divergence caused the final outputs to differ.")
+        parts.append("As a result, the final outputs were different.")
 
     return " ".join(parts)
 

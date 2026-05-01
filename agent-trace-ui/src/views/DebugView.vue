@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import { useTraceStore } from '../store/traceStore'
 import NLExplanation from '../components/NLExplanation.vue'
 import VerdictCard from '../components/VerdictCard.vue'
@@ -13,6 +13,7 @@ import BugToggle from '../components/BugToggle.vue'
 import QuickRun from '../components/QuickRun.vue'
 import RunTimeline from '../components/RunTimeline.vue'
 import LiveAgentIndicator from '../components/LiveAgentIndicator.vue'
+import DemoConclusion from '../components/DemoConclusion.vue'
 
 const store = useTraceStore()
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -20,10 +21,15 @@ const quickRunExpanded = ref(false)
 const dragOver = ref(false)
 const mainViewMode = ref<'graph' | 'compare'>('graph')
 const timelineCollapsed = ref(false)
+const demoRunning = ref(false)
 
-onMounted(() => {
-  store.fetchDemo()
-})
+async function runDemoAgent() {
+  demoRunning.value = true
+  quickRunExpanded.value = true
+  timelineCollapsed.value = false
+  await store.runDemo()
+  demoRunning.value = false
+}
 
 function onDragOver(e: DragEvent) {
   e.preventDefault()
@@ -68,20 +74,65 @@ function triggerUpload() {
       <div class="drag-hint">Drop trace.json here</div>
     </div>
 
+    <!-- Welcome / empty state -->
+    <div v-if="!store.traceData && !store.loading && !store.error" class="welcome-state">
+      <div class="welcome-card">
+        <div class="welcome-icon">◉</div>
+        <h1 class="welcome-title">AgentTrace</h1>
+        <p class="welcome-subtitle">
+          AI Agent Debugger — compare two runs and understand<br />
+          <strong>WHY</strong> your agent behaved differently.
+        </p>
+
+        <button
+          class="welcome-demo-btn"
+          @click="runDemoAgent"
+          :disabled="demoRunning"
+        >
+          <span v-if="demoRunning" class="spinner-inline"></span>
+          <span v-else class="welcome-btn-icon">▶</span>
+          {{ demoRunning ? 'Running demo agent...' : 'Run Demo Agent' }}
+        </button>
+
+        <p class="welcome-hint">
+          Runs a pre-built Travel Planner agent with a known bug.<br />
+          No setup required — see the full debug experience in one click.
+        </p>
+
+        <div class="welcome-divider">
+          <span>or</span>
+        </div>
+
+        <div class="welcome-upload">
+          <button class="welcome-upload-btn" @click="triggerUpload">
+            Upload a trace.json file
+          </button>
+          <p class="welcome-upload-hint">
+            Drag &amp; drop any <code>trace.json</code> onto this page
+          </p>
+        </div>
+      </div>
+    </div>
+
     <!-- Loading -->
     <div v-if="store.loading" class="loading-state">
       <div class="spinner"></div>
-      <p>Loading trace data...</p>
+      <p v-if="demoRunning">Running Travel Planner agent with bug enabled...</p>
+      <p v-else>Loading trace data...</p>
     </div>
 
     <!-- Error -->
-    <div v-else-if="store.error && !store.traceData" class="error-state">
-      <p>❌ {{ store.error }}</p>
-      <button @click="store.fetchDemo()">Retry</button>
+    <div v-if="store.error && !store.traceData && !store.loading" class="error-state">
+      <p>Failed to load</p>
+      <p class="error-detail">{{ store.error }}</p>
+      <button @click="runDemoAgent">Retry</button>
     </div>
 
     <!-- Main layout -->
-    <template v-else-if="store.traceData">
+    <template v-if="store.traceData">
+      <!-- Demo conclusion (first-screen verdict) -->
+      <DemoConclusion />
+
       <!-- Top: Bug Toggle -->
       <BugToggle />
 
@@ -115,7 +166,7 @@ function triggerUpload() {
         </button>
       </div>
 
-      <div class="main-content">
+      <div id="main-content" class="main-content">
         <RunTimeline v-model:collapsed="timelineCollapsed" />
         <div class="graph-area">
           <GraphView v-if="mainViewMode === 'graph'" />
@@ -127,6 +178,16 @@ function triggerUpload() {
           <DiffPanel />
           <StepDetail />
         </div>
+      </div>
+
+      <!-- Fix prompt (after demo with bug) -->
+      <div v-if="store.demoRunComplete && !store.whatIfData && !store.whatIfLoading" class="fix-prompt">
+        <div class="fix-prompt-text">
+          <strong>Bug case loaded.</strong> See what the fix looks like?
+        </div>
+        <button class="fix-prompt-btn" @click="store.fetchWhatIf()">
+          Show Fix
+        </button>
       </div>
 
       <!-- Upload bar -->
@@ -168,6 +229,141 @@ function triggerUpload() {
   background: #f5f7fa;
   position: relative;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* ── Welcome / empty state ── */
+.welcome-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 80vh;
+  padding: 40px 20px;
+}
+
+.welcome-card {
+  text-align: center;
+  max-width: 480px;
+}
+
+.welcome-icon {
+  font-size: 48px;
+  color: #409EFF;
+  margin-bottom: 16px;
+  opacity: 0.8;
+}
+
+.welcome-title {
+  font-size: 32px;
+  font-weight: 800;
+  color: #303133;
+  margin: 0 0 8px;
+  letter-spacing: -0.5px;
+}
+
+.welcome-subtitle {
+  font-size: 15px;
+  color: #606266;
+  line-height: 1.7;
+  margin: 0 0 28px;
+}
+
+.welcome-subtitle strong {
+  color: #409EFF;
+}
+
+.welcome-demo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 40px;
+  background: linear-gradient(135deg, #409EFF, #337ecc);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 4px 20px rgba(64, 158, 255, 0.35);
+}
+
+.welcome-demo-btn:hover:not(:disabled) {
+  box-shadow: 0 6px 28px rgba(64, 158, 255, 0.5);
+  transform: translateY(-2px);
+}
+
+.welcome-demo-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.welcome-btn-icon {
+  font-size: 18px;
+}
+
+.spinner-inline {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+.welcome-hint {
+  font-size: 12px;
+  color: #909399;
+  margin: 16px 0 0;
+  line-height: 1.6;
+}
+
+.welcome-divider {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 32px 0;
+  color: #C0C4CC;
+  font-size: 12px;
+}
+
+.welcome-divider::before,
+.welcome-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #e4e7ed;
+}
+
+.welcome-upload-btn {
+  padding: 10px 24px;
+  background: #fff;
+  border: 1px solid #d9ecff;
+  color: #409EFF;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.welcome-upload-btn:hover {
+  background: #ecf5ff;
+  border-color: #409EFF;
+}
+
+.welcome-upload-hint {
+  font-size: 12px;
+  color: #C0C4CC;
+  margin-top: 8px;
+}
+
+.welcome-upload-hint code {
+  background: #f5f7fa;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
 }
 
 /* ── Drag overlay ── */
@@ -289,6 +485,44 @@ function triggerUpload() {
 }
 
 /* ── Upload bar ── */
+/* ── Fix prompt ── */
+.fix-prompt {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 12px 20px;
+  background: linear-gradient(135deg, #fdf6ec, #fef0e6);
+  border: 1px solid #faecd8;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.fix-prompt-text {
+  font-size: 13px;
+  color: #E6A23C;
+}
+
+.fix-prompt-text strong {
+  color: #cf7b1d;
+}
+
+.fix-prompt-btn {
+  padding: 6px 18px;
+  background: #E6A23C;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.fix-prompt-btn:hover {
+  background: #cf7b1d;
+}
+
 .upload-bar {
   display: flex;
   align-items: center;
