@@ -15,12 +15,48 @@ from pathlib import Path
 
 from .trace_core import TracedAgent, explain_diff
 from .trace_export import TraceExport
-from .trace_diff import TraceDiffer, render_diff
+from .trace_diff import TraceDiffer, render_diff, render_causal_verdict
+from .instrument.auto import auto_trace
 
 
 # ============================================================
 # Helpers
 # ============================================================
+
+def _parse_script_ref(script: str):
+    """
+    Parse a script reference that may include an object path.
+
+    Supports:
+        my_agent.py                  → (my_agent.py, None)
+        my_agent.py:agent            → (my_agent.py, "agent")
+        my_agent.py:create_agent     → (my_agent.py, "create_agent")
+        main.py:app.agent            → (main.py, "app.agent")
+        pkg/module.py:MyClass.build  → (pkg/module.py, "MyClass.build")
+    """
+    if ":" in script:
+        # Split on the LAST colon that precedes a Python identifier
+        path_part, obj_part = script.rsplit(":", 1)
+        if os.path.exists(path_part) or path_part.endswith(".py"):
+            return path_part, obj_part
+        # If path doesn't exist, maybe the colon is part of a Windows path (D:\...)
+        # In that case there's no object reference
+        return script, None
+    return script, None
+
+
+def _resolve_dotted(obj, path: str):
+    """Resolve dotted attribute path on an object: 'app.agent' → obj.app.agent"""
+    for part in path.split("."):
+        if part.endswith("()"):
+            # Callable invocation: 'create_agent()'
+            part = part[:-2]
+            obj = getattr(obj, part)
+            obj = obj()
+        else:
+            obj = getattr(obj, part)
+    return obj
+
 
 def _load_module(path: str):
     """Dynamically import a Python module from a file path."""
@@ -32,13 +68,44 @@ def _load_module(path: str):
     return mod
 
 
-def _find_agent(mod):
+def _find_agent(mod, object_path: str = None):
     """
-    Find an agent in a module. Tries common conventions:
-    - Variable named 'agent'
-    - Class named 'Agent' (instantiate it)
-    - First object with a .run() method
+    Find an agent in a module.
+
+    If object_path is given (from module:object syntax):
+        Resolve dotted path from the module.
+        If the result is callable, call it to get the agent.
+        Otherwise return it directly.
+
+    Otherwise, tries common conventions:
+        - Variable named 'agent'
+        - Class named 'Agent' (instantiate it)
+        - First object with a .run() method
     """
+    if object_path:
+        try:
+            obj = _resolve_dotted(mod, object_path)
+        except AttributeError:
+            raise ValueError(
+                f"Object '{object_path}' not found in {mod.__file__}. "
+                f"Check the module:object path."
+            )
+        if isinstance(obj, type):
+            # It's a class — instantiate it
+            obj = obj()
+        elif callable(obj) and not hasattr(obj, "run"):
+            # It's a factory function — call it to get the agent
+            try:
+                obj = obj()
+            except TypeError:
+                pass
+        if hasattr(obj, "run") and callable(obj.run):
+            return obj
+        raise ValueError(
+            f"Object '{object_path}' in {mod.__file__} does not have a .run() method. "
+            f"Found: {type(obj).__name__}"
+        )
+
     # 1. Look for 'agent' variable
     if hasattr(mod, "agent"):
         return mod.agent
@@ -77,9 +144,14 @@ def _resolve_input(input_val: str):
 
 def cmd_run(args):
     """Run an agent with tracing and export the trace."""
-    print(f"AgentTrace: Loading {args.script}...")
-    mod = _load_module(args.script)
-    agent = _find_agent(mod)
+    # Auto-enable framework patches (OpenAI, LangChain)
+    auto_trace()
+
+    script_path, obj_path = _parse_script_ref(args.script)
+
+    print(f"AgentTrace: Loading {script_path}...")
+    mod = _load_module(script_path)
+    agent = _find_agent(mod, obj_path)
     print(f"  Agent: {agent.__class__.__name__}")
 
     traced = TracedAgent(agent, out_dir=os.path.dirname(args.out) or ".")
@@ -137,13 +209,17 @@ def cmd_diff(args):
 
 def cmd_debug(args):
     """Run an agent twice with different inputs, diff, and explain."""
+    # Auto-enable framework patches (OpenAI, LangChain)
+    auto_trace()
+
     print("AgentTrace: Debug Mode")
     print("=" * 58)
     print()
 
     # Load agent
-    mod = _load_module(args.script)
-    agent = _find_agent(mod)
+    script_path, obj_path = _parse_script_ref(args.script)
+    mod = _load_module(script_path)
+    agent = _find_agent(mod, obj_path)
     traced = TracedAgent(agent)
 
     # Run A
@@ -177,13 +253,13 @@ def cmd_debug(args):
         diff_result.causal_narrative = causal_narrative
         _enrich_causal_chain(diff_result, traced.last_ctx, traced_b.last_ctx)
 
-    # Render engineer-level diff
-    print(render_diff(diff_result, level=2))
+    # Render the causal verdict (interview-ready format)
+    print(render_causal_verdict(diff_result))
 
-    # Show causal explanation if available
-    if diff_result.causal_narrative:
+    # Show detailed causal chain if verbose
+    if getattr(args, 'verbose', False) and diff_result.causal_narrative:
         print("=" * 58)
-        print("  CAUSAL EXPLANATION")
+        print("  DETAILED CAUSAL CHAIN")
         print("=" * 58)
         print(diff_result.causal_narrative)
         print()
@@ -267,13 +343,219 @@ def main():
                          help="Input for run A")
     p_debug.add_argument("--input2", "-j", required=True,
                          help="Input for run B")
+    p_debug.add_argument("--verbose", "-v", action="store_true",
+                         help="Show detailed causal chain")
     p_debug.set_defaults(func=cmd_debug)
+
+    # agent-demo
+    p_demo = sub.add_parser("demo", help="One-click demo: run agent, start UI")
+    p_demo.add_argument("--bug", choices=["on", "off"], default="on",
+                        help="Enable/disable LLM misroute bug (default: on)")
+    p_demo.add_argument("--port", type=int, default=8765,
+                        help="Backend API port (default: 8765)")
+    p_demo.add_argument("--no-browser", action="store_true",
+                        help="Don't auto-open browser")
+    p_demo.set_defaults(func=cmd_demo)
+
+    # agent-dev
+    p_dev = sub.add_parser("dev", help="One-command debugger: run your agent + open UI")
+    p_dev.add_argument("script", help="Path to your agent script (e.g., my_agent.py)")
+    p_dev.add_argument("--input", "-i", required=True,
+                       help="Input for run A")
+    p_dev.add_argument("--input2", "-j", required=True,
+                       help="Input for run B (compare against)")
+    p_dev.add_argument("--port", type=int, default=8765,
+                       help="Backend API port (default: 8765)")
+    p_dev.add_argument("--no-browser", action="store_true",
+                       help="Don't auto-open browser")
+    p_dev.set_defaults(func=cmd_dev)
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         return 1
     return args.func(args)
+
+
+def cmd_demo(args):
+    """One-click demo: run Travel Planner, start backend + frontend, open browser."""
+    import os
+    demo_script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "demo.py")
+    argv = [sys.executable, demo_script,
+            "--bug", args.bug,
+            "--port", str(args.port)]
+    if args.no_browser:
+        argv.append("--no-browser")
+    os.execv(sys.executable, argv)
+
+
+def cmd_dev(args):
+    """One-command debugger: run YOUR agent twice, diff, open UI."""
+    import os
+    import json
+    import time
+    import signal
+    import subprocess
+    import webbrowser
+
+    auto_trace()
+
+    script_path, obj_path = _parse_script_ref(args.script)
+    script_path = os.path.abspath(script_path)
+    ui_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent-trace-ui")
+    dev_json_path = os.path.join(ui_dir, "public", "dev_trace.json")
+
+    print()
+    print("=" * 55)
+    print("  AgentTrace Dev :: Live Debugger")
+    print("=" * 55)
+    print()
+
+    # ── Step 1: Load & run agent ──
+    print("=" * 55)
+    print("  Step 1/3: Running your agent (2x)...")
+    print("=" * 55)
+
+    mod = _load_module(script_path)
+    agent = _find_agent(mod, obj_path)
+    print(f"  Agent: {agent.__class__.__name__}")
+    if obj_path:
+        print(f"  Entry: {script_path}:{obj_path}")
+    print(f"  Script: {script_path}")
+
+    input_a = _resolve_input(args.input)
+    input_b = _resolve_input(args.input2)
+
+    traced_a = TracedAgent(agent)
+    print(f"\n  [Run A] Input: {input_a[:80]}")
+    result_a = traced_a.run(input_a)
+    trace_a_path = traced_a.last_trace_path
+    print(f"    => {str(result_a)[:100]}")
+
+    traced_b = TracedAgent(agent, out_dir=os.path.dirname(trace_a_path) or ".")
+    print(f"\n  [Run B] Input: {input_b[:80]}")
+    result_b = traced_b.run(input_b)
+    trace_b_path = traced_b.last_trace_path
+    print(f"    => {str(result_b)[:100]}")
+
+    # ── Step 2: Diff & generate UI JSON ──
+    print(f"\n  Diffing traces...")
+    from .frontend_adapter import adapt_diff_result
+
+    export_a = TraceExport.from_file(trace_a_path)
+    export_b = TraceExport.from_file(trace_b_path)
+    differ = TraceDiffer(export_a, export_b)
+    diff_result = differ.diff()
+
+    if traced_a.last_ctx and traced_b.last_ctx:
+        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+        _enrich_causal_chain(diff_result, traced_a.last_ctx, traced_b.last_ctx)
+
+    ui_json = adapt_diff_result(diff_result, export_a, export_b)
+
+    # Write to public/dev_trace.json
+    os.makedirs(os.path.dirname(dev_json_path), exist_ok=True)
+    with open(dev_json_path, "w", encoding="utf-8") as f:
+        json.dump(ui_json, f, indent=2, ensure_ascii=False)
+    print(f"  Trace written: {dev_json_path}")
+
+    # Print verdict
+    print(f"\n  [verdict] {ui_json['verdict'][:120]}")
+    if ui_json.get("diagnosis"):
+        d = ui_json["diagnosis"]
+        print(f"  [diagnosis]  {d['type']} ({d['confidence']})")
+
+    # Cleanup raw trace files
+    for t in [trace_a_path, trace_b_path]:
+        try:
+            os.remove(t)
+        except OSError:
+            pass
+
+    # ── Step 3: Start backend + frontend ──
+    print(f"\n" + "=" * 55)
+    print(f"  Step 2/3: Starting backend + frontend...")
+    print("=" * 55)
+
+    port = args.port
+
+    # Backend
+    backend_proc = subprocess.Popen(
+        [sys.executable, os.path.join(ui_dir, "server.py"), "--port", str(port)],
+        cwd=ui_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    time.sleep(1.5)
+    print(f"  Backend: http://127.0.0.1:{port}")
+
+    # Frontend
+    node_ok = False
+    try:
+        subprocess.run(["node", "--version"], capture_output=True, timeout=5)
+        node_ok = True
+    except Exception:
+        pass
+
+    if node_ok:
+        try:
+            if not os.path.exists(os.path.join(ui_dir, "node_modules")):
+                print("  Installing npm dependencies (first run)...")
+                subprocess.run(["npm", "install"], cwd=ui_dir, capture_output=True)
+
+            frontend_proc = subprocess.Popen(
+                ["npm", "run", "dev"],
+                cwd=ui_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            time.sleep(3)
+            print(f"  Frontend: http://localhost:5173")
+        except Exception as e:
+            print(f"  [WARN] Frontend failed: {e}")
+            frontend_proc = None
+    else:
+        print("  [WARN] Node.js not found. Open agent-trace-ui/dist/index.html manually.")
+        frontend_proc = None
+
+    # ── Step 4: Open browser ──
+    print(f"\n" + "=" * 55)
+    print(f"  Step 3/3: Opening browser...")
+    print("=" * 55)
+
+    if not args.no_browser:
+        time.sleep(1)
+        webbrowser.open("http://localhost:5173")
+        print(f"  Browser opened.")
+
+    print()
+    print("  ╔" + "═" * 53 + "╗")
+    print("  ║  [OK] AgentTrace Dev is live!                        ║")
+    print("  ║                                                   ║")
+    print("  ║  UI:  http://localhost:5173                        ║")
+    print(f"  ║  API: http://127.0.0.1:{port}/api/trace/dev        ║")
+    print("  ║                                                   ║")
+    print("  ║  Press Ctrl+C to stop all services                ║")
+    print("  ╚" + "═" + 53 + "╝")
+    print()
+
+    def shutdown(sig, frame):
+        print("\n  Shutting down...")
+        if frontend_proc:
+            frontend_proc.terminate()
+        if backend_proc:
+            backend_proc.terminate()
+        print("  Done.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        shutdown(None, None)
 
 
 if __name__ == "__main__":

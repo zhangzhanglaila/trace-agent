@@ -1,0 +1,80 @@
+import type { TraceData } from '../types/trace'
+
+export const demoData: TraceData = {
+  verdict: "Run B failed because the LLM router selected `summarize` instead of `activity_search` — the wrong tool received incompatible arguments, triggering an error cascade.",
+  diagnosis: {
+    type: "LLM Hallucination → Error Cascade",
+    confidence: "High",
+    category: "Planning Error",
+  },
+  root_cause: {
+    variable: "selected_tool",
+    run_a: "activity_search",
+    run_b: "summarize",
+    source: "LLM output (step 3)",
+  },
+  graph: {
+    nodes: [
+      { id: "s1", name: "classify_intent", type: "llm", label: "LLM: classify_intent", status: "success", inputs: { prompt: "Trip to Paris for hiking" }, outputs: { intent: "advice_request" }, latency_ms: 12, diverged: false, step_index: 0 },
+      { id: "s2", name: "planner_llm", type: "llm", label: "LLM: planner_llm", status: "success", inputs: { query: "Trip to Paris for hiking" }, outputs: { plan: { tool: "weather_current" } }, latency_ms: 8, diverged: false, step_index: 1 },
+      { id: "s3", name: "weather_current", type: "tool", label: "Tool: weather_current", status: "success", inputs: { city: "paris" }, outputs: { weather_current_result: { temp: 18, condition: "cloudy" } }, latency_ms: 5, diverged: false, step_index: 2 },
+      { id: "s4", name: "planner_llm", type: "llm", label: "LLM: planner_llm", status: "success", inputs: { query: "Trip to Paris for hiking" }, outputs: { plan: { tool: "activity_search" } }, latency_ms: 9, diverged: false, step_index: 3, is_divergence_point: true },
+      { id: "s5", name: "activity_search", type: "tool", label: "Tool: activity_search", status: "success", inputs: { activity: "hiking" }, outputs: { activity_result: "Ideal hiking conditions." }, latency_ms: 3, diverged: false, step_index: 4, is_root_cause: true },
+      { id: "s5b", name: "summarize", type: "tool", label: "Tool: summarize", status: "error", inputs: { text: "hiking conditions" }, outputs: {}, error: "Summarization failed", latency_ms: 2, diverged: true, step_index: 4 },
+      { id: "s6", name: "planner_llm", type: "llm", label: "LLM: planner_llm (retry)", status: "error", inputs: { query: "retry: Trip to Paris" }, outputs: {}, latency_ms: 7, diverged: true, step_index: 5 },
+      { id: "s7", name: "summarize", type: "tool", label: "Tool: summarize (retry)", status: "error", inputs: { text: "retry context" }, outputs: {}, error: "Summarization failed", latency_ms: 2, diverged: true, step_index: 6 },
+    ],
+    edges: [
+      { source: "s1", target: "s2", type: "sequential", style: "solid" },
+      { source: "s2", target: "s3", type: "sequential", style: "solid" },
+      { source: "s3", target: "s4", type: "sequential", style: "solid" },
+      { source: "s4", target: "s5", type: "branch_true", style: "solid", label: "T" },
+      { source: "s4", target: "s5b", type: "branch_false", style: "dashed", label: "F" },
+      { source: "s5b", target: "s6", type: "sequential", style: "solid" },
+      { source: "s6", target: "s7", type: "sequential", style: "solid" },
+    ],
+    primary_run: "run_b",
+    secondary_nodes: [],
+  },
+  diff: {
+    first_divergence: {
+      type: "step",
+      id: "activity_search",
+      description: "Run A selected activity_search, Run B selected summarize",
+      run_a: "activity_search",
+      run_b: "summarize",
+    },
+    step_diffs: [
+      { step_name: "classify_intent", only_in: null, run_a_status: "success", run_b_status: "success", run_a_error: null, run_b_error: null, diverged: false },
+      { step_name: "planner_llm", only_in: null, run_a_status: "success", run_b_status: "success", run_a_error: null, run_b_error: null, diverged: false },
+      { step_name: "weather_current", only_in: null, run_a_status: "success", run_b_status: "success", run_a_error: null, run_b_error: null, diverged: false },
+      { step_name: "selected_tool", only_in: null, run_a_status: "success", run_b_status: "success", run_a_error: null, run_b_error: null, diverged: true },
+      { step_name: "summarize", only_in: "run_b", run_a_status: null, run_b_status: "error", run_a_error: null, run_b_error: "Summarization failed", diverged: true },
+    ],
+    branch_diffs: [],
+    path_impact: [
+      { index: 0, run_a: "classify_intent", run_b: "classify_intent", diverged: false },
+      { index: 1, run_a: "planner_llm", run_b: "planner_llm", diverged: false },
+      { index: 2, run_a: "weather_current", run_b: "weather_current", diverged: false },
+      { index: 3, run_a: "planner_llm", run_b: "planner_llm", diverged: false },
+      { index: 4, run_a: "activity_search", run_b: "summarize", diverged: true },
+      { index: 5, run_a: null, run_b: "planner_llm (retry)", diverged: true },
+      { index: 6, run_a: null, run_b: "summarize (retry)", diverged: true },
+    ],
+    has_diverged: true,
+    output_diverged: true,
+  },
+  output: {
+    run_a: "[OK] Activity advice: Ideal hiking conditions. Trails dry and visible.",
+    run_b: "[FAIL] Summarization failed: Summarization failed: model confidence too low",
+    diverged: true,
+  },
+  fix_suggestion: "Consider adding a tool selection guardrail:\n  Define explicit preconditions for: activity_search, summarize\n  When weather is available, prefer activity_search over summarize.",
+  explanation: "Run B failed because at the decision step, the agent selected `summarize` instead of `activity_search`. This divergence at \"activity_search\" caused downstream errors: the summarize tool received incompatible activity data and failed, triggering a retry cascade that exhausted the step budget. The root cause is the `selected_tool` variable: Run A correctly used `activity_search` to fetch hiking conditions, but Run B incorrectly used `summarize` before adequate data was collected. Recommendation: Add a tool selection guardrail that checks preconditions before routing.",
+  meta: {
+    trace_id_a: "trace_tokyo_hiking",
+    trace_id_b: "trace_paris_hiking",
+    run_a_steps: 5,
+    run_b_steps: 7,
+  },
+}

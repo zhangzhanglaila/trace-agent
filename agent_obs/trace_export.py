@@ -344,6 +344,7 @@ class TraceExporter:
             outputs["merged"] = True
         elif step_type == "output":
             inputs["var"] = step.get("var", "")
+            inputs["result"] = step.get("inputs", {}).get("result", "")
             outputs["value"] = step.get("value", "")
         else:
             outputs["raw"] = str(instr.args) if instr else ""

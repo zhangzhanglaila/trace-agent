@@ -30,7 +30,29 @@
       "Bash(python agenttrace.py counterfactual examples/case_mild_discomfort.json)",
       "Bash(python agenttrace.py export-scm examples/case_mild_discomfort.json)",
       "Bash(python:*)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(npm create *)",
+      "Bash(npm install *)",
+      "Read(//d//**)",
+      "Read(//mnt/d/AgentTrace/**)",
+      "Read(//mnt/d/**)",
+      "Read(///d/agent-trace-ui//**)",
+      "Bash(npx vue-tsc *)",
+      "Bash(npm run *)",
+      "Bash(kill %1)",
+      "Bash(rm -rf D:/AgentTrace/agent_obs/__pycache__)",
+      "Bash(rm -rf D:/AgentTrace/agent_obs/*.pyc)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(rm -rf /d/AgentTrace/agent_obs/__pycache__)",
+      "Bash(rm -rf /d/AgentTrace/agent_obs/instrument/__pycache__)",
+      "Bash(taskkill //F //IM node.exe)",
+      "Bash(rm -f trace_*.json)",
+      "Bash(ls trace_*.json)",
+      "Bash(npx vite *)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 33516 //PID 13948 //PID 35780)",
+      "Bash(wait)"
     ]
   }
 }

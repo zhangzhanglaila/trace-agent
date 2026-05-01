@@ -457,23 +457,32 @@ class TraceDiffer:
     @staticmethod
     def _get_final_output(trace: TraceExport) -> Any:
         """Extract final output from a trace."""
-        # Priority 1: Explicit output step
+        # Priority 1: Explicit output step (type "output" or chain named "Output:")
         for run in reversed(trace.runs):
-            if run.run_type == "chain" and run.name.startswith("Output:"):
-                val = run.outputs.get("value")
+            if run.run_type in ("output", "chain") and ("output" in run.name.lower() or run.run_type == "output"):
+                val = run.outputs.get("value") or run.outputs.get("result")
+                if not val:
+                    val = run.inputs.get("result") or run.inputs.get("value")
                 if val is not None:
                     return val
 
         # Priority 2: Last tool result (for auto-traced agents)
         for run in reversed(trace.runs):
             if run.run_type == "tool":
-                val = run.outputs.get("result")
+                val = run.outputs.get("result") or run.inputs.get("result")
+                if not val:
+                    for k, v in run.outputs.items():
+                        if k != "args" and v:
+                            val = str(v)[:500]
+                            break
                 if val is not None:
                     return val
 
         # Priority 3: Last run output
         for run in reversed(trace.runs):
             val = run.outputs.get("result") or run.outputs.get("value")
+            if not val:
+                val = run.inputs.get("result") or run.inputs.get("value")
             if val is not None:
                 return val
 
@@ -599,3 +608,665 @@ def diff_traces(trace_a: TraceExport, trace_b: TraceExport) -> TraceDiffResult:
     """Quick one-liner: diff two trace exports."""
     differ = TraceDiffer(trace_a, trace_b)
     return differ.diff()
+
+
+# ============================================================
+# Interview-Ready Causal Verdict Renderer
+# ============================================================
+
+def render_causal_verdict(diff: TraceDiffResult) -> str:
+    """
+    Render the diff as a visually impactful causal verdict.
+
+    Upgraded output structure (product-ready):
+      0. VERDICT — one-line human-readable summary (秒懂)
+      1. ROOT CAUSE VARIABLE — variable-level, not just tool-level
+      2. BLAST RADIUS — visual cascade showing downstream impact
+      3. WHY — plain-language explanation of the failure mechanism
+      4. DIAGNOSIS — error type classifier + confidence + suggested fix
+    """
+    lines = []
+    H = "=" * 58
+
+    if not diff.has_diverged:
+        lines.append("")
+        lines.append(f"  {H}")
+        lines.append(f"     No divergence detected. Both runs followed identical paths.")
+        lines.append(f"  {H}")
+        lines.append("")
+        return "\n".join(lines)
+
+    narrative = diff.causal_narrative or ""
+
+    # ── Extract structured info ──
+    verdict_text = _build_verdict(diff, narrative)
+    root_var, var_a_val, var_b_val, var_source = _extract_root_variable(diff, narrative)
+    impact_line = _extract_line(narrative, "Impact score:")
+    downstream_line = _extract_line(narrative, "Downstream impact:")
+    diag_type, diag_conf, diag_cat = _classify_error(diff, narrative)
+    fix_text = _suggest_fix(diag_type, root_var, diff, narrative)
+
+    # ── 0: VERDICT (one-line summary — most important) ──
+    lines.append("")
+    lines.append(f"  VERDICT")
+    lines.append(f"  {verdict_text}")
+    lines.append("")
+
+    # ── 1: ROOT CAUSE VARIABLE (variable-level, not tool-level) ──
+    lines.append(f"  {H}")
+    lines.append(f"     ROOT CAUSE VARIABLE")
+    lines.append(f"  {H}")
+    lines.append("")
+
+    if root_var:
+        lines.append(f"  Variable: `{root_var}` ({var_source})")
+        lines.append("")
+        lines.append(f"  Value Diff:")
+        lines.append(f"    Run A: {var_a_val}")
+        lines.append(f"    Run B: {var_b_val}")
+    else:
+        # Fallback to old root cause format
+        root_cause, _, _ = _extract_root_cause(diff, narrative)
+        if root_cause:
+            for line in root_cause.split("\n"):
+                lines.append(f"  {line}")
+    lines.append("")
+
+    # ── 2: BLAST RADIUS ──
+    lines.append(f"  {H}")
+    lines.append(f"     BLAST RADIUS")
+    lines.append(f"  {H}")
+    lines.append("")
+
+    if impact_line:
+        lines.append(f"  {impact_line.strip()}")
+    if downstream_line:
+        lines.append(f"  {downstream_line.strip()}")
+    lines.append("")
+
+    cascade = _build_cascade(diff, narrative)
+    if cascade:
+        lines.append(f"  Failure cascade:")
+        lines.append("")
+        for line in cascade:
+            lines.append(f"  {line}")
+        lines.append("")
+
+    # ── 3: WHY ──
+    why = _build_why_explanation(diff, narrative)
+    if why:
+        lines.append(f"  {H}")
+        lines.append(f"     WHY")
+        lines.append(f"  {H}")
+        lines.append("")
+        for line in why:
+            lines.append(f"  {line}")
+        lines.append("")
+
+    # ── 4: DIAGNOSIS + FIX ──
+    lines.append(f"  {H}")
+    lines.append(f"     DIAGNOSIS")
+    lines.append(f"  {H}")
+    lines.append("")
+
+    lines.append(f"  Type:    {diag_type}")
+    lines.append(f"  Confidence: {diag_conf}")
+    lines.append(f"  Category:   {diag_cat}")
+    lines.append("")
+
+    if fix_text:
+        lines.append(f"  Suggested Fix:")
+        for fix_line in fix_text:
+            lines.append(f"    {fix_line}")
+        lines.append("")
+
+    lines.append(f"  {H}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# Verdict + Variable-level helpers (product-ready upgrades)
+# ============================================================
+
+def _build_verdict(diff: TraceDiffResult, narrative: str) -> str:
+    """Build a one-line human-readable verdict — the most important output."""
+    output_a = str(diff.output_a)[:80] if diff.output_a else "no output"
+    output_b = str(diff.output_b)[:80] if diff.output_b else "no output"
+
+    has_error_a = "[FAIL]" in output_a or "[PARTIAL]" in output_a or "error" in output_a.lower()
+    has_error_b = "[FAIL]" in output_b or "[PARTIAL]" in output_b or "error" in output_b.lower()
+
+    # Extract the key variable (already prioritized + cleaned)
+    root_var, var_a, var_b, _ = _extract_root_variable(diff, narrative)
+
+    # ── Build the most human-readable verdict ──
+    if root_var == "selected_tool":
+        if has_error_b and not has_error_a:
+            return (f"Run B failed because the LLM router selected `{var_b}` "
+                    f"instead of `{var_a}` — the wrong tool received incompatible "
+                    f"arguments, triggering an error cascade.")
+        if has_error_a and not has_error_b:
+            return (f"Run A failed because the LLM router selected `{var_a}` "
+                    f"instead of `{var_b}` — the misrouted tool failed and "
+                    f"the retry budget was exhausted.")
+
+    if root_var and var_a and var_b:
+        if has_error_b and not has_error_a:
+            return (f"Run B failed because `{root_var}` = `{var_b}` "
+                    f"(vs `{var_a}` in Run A) — this single variable change "
+                    f"cascaded into a degraded final output.")
+        if has_error_a and not has_error_b:
+            return (f"Run A failed because `{root_var}` = `{var_a}` "
+                    f"(vs `{var_b}` in Run B) — this divergence propagated "
+                    f"through downstream steps.")
+        if diff.output_diverged:
+            return (f"Both runs took different paths because `{root_var}` diverged "
+                    f"(`{var_a}` vs `{var_b}`), producing different final outputs.")
+        return (f"`{root_var}` diverged (`{var_a}` vs `{var_b}`) but both "
+                f"runs converged to similar results via different paths.")
+
+    # Fallback
+    if diff.first_divergence and diff.first_divergence.type != "none":
+        fd = diff.first_divergence
+        if diff.output_diverged:
+            return (f"Output diverged at `{fd.id}` — "
+                    f"Run A: {fd.run_a}, Run B: {fd.run_b}.")
+        return (f"Paths split at `{fd.id}` but outputs converged.")
+
+    return diff.summary if diff.summary else "Execution paths diverged."
+
+
+def _extract_root_variable(diff: TraceDiffResult, narrative: str) -> tuple:
+    """
+    Extract the root cause at the VARIABLE level (not tool level).
+
+    Collects ALL variable diffs, then picks the most causally significant one.
+    Priority: selected_tool > *_result > plan > intent > input.* > other
+
+    Returns (variable_name, run_a_value, run_b_value, source_description).
+    """
+    import re
+
+    # ── Collect all variable diffs ──
+    candidates = []  # (priority, var_name, val_a, val_b, source)
+    for line in narrative.split("\n"):
+        line_s = line.strip()
+        if "var:" not in line_s:
+            continue
+
+        var_part = line_s.split("var:", 1)[1].strip()
+        colon_idx = var_part.find(":")
+        if colon_idx < 0:
+            continue
+
+        var_name = var_part[:colon_idx].strip()
+        values_part = var_part[colon_idx + 1:].strip()
+
+        # Parse the two values separated by →
+        arrow_match = re.search(r'"([^"]*)"\s*→\s*"([^"]*)"', values_part)
+        if not arrow_match:
+            arrow_match = re.search(r"'([^']*)'\s*→\s*'([^']*)'", values_part)
+        if not arrow_match:
+            # Truncated format with Unicode arrow
+            arrow_match = re.search(r'"([^"]*)"\s*.*?"([^"]*)"', values_part)
+
+        if arrow_match:
+            val_a = arrow_match.group(1)
+            val_b = arrow_match.group(2)
+
+            # Clean values: extract tool name from plan JSON if applicable
+            if var_name == "plan" or var_name == "selected_tool":
+                # Try to extract just the tool name from JSON-like strings
+                tool_match_a = re.search(r"'tool':\s*'(\w+)'", val_a)
+                tool_match_b = re.search(r"'tool':\s*'(\w+)'", val_b)
+                if tool_match_a and tool_match_b:
+                    val_a = tool_match_a.group(1)
+                    val_b = tool_match_b.group(1)
+                # Truncate long values
+                if len(val_a) > 50:
+                    val_a = val_a[:47] + "..."
+                if len(val_b) > 50:
+                    val_b = val_b[:47] + "..."
+
+            source = _infer_variable_source(var_name, narrative)
+
+            # Assign priority (lower = more significant)
+            if var_name == "selected_tool":
+                priority = 0
+            elif var_name.endswith("_result"):
+                priority = 1
+            elif var_name == "plan":
+                priority = 2
+            elif var_name == "intent":
+                priority = 3
+            elif var_name.startswith("input."):
+                priority = 4
+            else:
+                priority = 5
+
+            candidates.append((priority, var_name, val_a, val_b, source))
+
+    # ── Pick the highest-priority (lowest number) candidate ──
+    if candidates:
+        candidates.sort(key=lambda c: c[0])
+        _, var_name, val_a, val_b, source = candidates[0]
+        return var_name, val_a, val_b, source
+
+    # ── Fallback: extract from diff structure ──
+    if diff.first_divergence and diff.first_divergence.type == "branch":
+        fd = diff.first_divergence
+        bd = next((bd for bd in diff.branch_diffs if bd.condition == fd.id), None)
+        if bd:
+            return (bd.condition, str(bd.run_a_path), str(bd.run_b_path),
+                    "decision evaluation")
+
+    return "", "", "", ""
+
+
+def _infer_variable_source(var_name: str, narrative: str) -> str:
+    """Infer where a variable came from."""
+    if var_name in ("selected_tool", "plan"):
+        return "LLM output"
+    if var_name.endswith("_result"):
+        tool = var_name.replace("_result", "")
+        return f"tool `{tool}` output"
+    if var_name in ("intent",):
+        return "LLM classification"
+    if var_name.startswith("input."):
+        return "routing input"
+    if var_name in ("should_search", "should_calculate", "route_to_", "need_",
+                    "needs_", "advice_", "risk_"):
+        return "decision evaluation"
+    return "trace variable"
+
+
+def _classify_error(diff: TraceDiffResult, narrative: str) -> tuple:
+    """
+    Classify the error type with confidence.
+
+    Distinguishes:
+      - True LLM misroute (hallucination / non-deterministic)
+      - Error-retry loop (deterministic planner has no fallback for failures)
+      - Input-driven divergence (different queries → different tools)
+      - General path divergence
+
+    Returns (type_description, confidence, category).
+    """
+    narrative_lower = narrative.lower()
+    has_explicit_misroute = "misrouted" in narrative_lower or "hallucinat" in narrative_lower
+    has_selected_tool = "selected_tool" in narrative_lower
+    has_retry = "retry" in narrative_lower
+    has_error = "error" in narrative_lower
+
+    error_count = narrative_lower.count("error")
+    output_a = str(diff.output_a) if diff.output_a else ""
+    output_b = str(diff.output_b) if diff.output_b else ""
+    has_fail_output = "[FAIL]" in output_a or "[FAIL]" in output_b
+
+    # ── Classify ──
+    if has_explicit_misroute and has_error:
+        # The trace explicitly recorded a misroute → LLM hallucination
+        diag_type = "LLM Hallucination → Error Cascade"
+        category = "Planning Error"
+        confidence = "High"
+    elif has_error and has_retry and has_fail_output:
+        # Error triggered retries, and the output is degraded
+        diag_type = "Error-Retry Loop (Missing Fallback)"
+        category = "Recovery Failure"
+        confidence = "High" if error_count >= 3 else "Medium"
+    elif has_selected_tool and not has_error:
+        # Different tools selected, but no errors → input-driven divergence
+        diag_type = "Input-Driven Tool Selection"
+        category = "Input Sensitivity"
+        confidence = "High"
+    elif has_selected_tool and has_error:
+        # Tool selection diverged and errors occurred (but no explicit misroute recorded)
+        diag_type = "Tool Selection Divergence"
+        category = "Planning Gap"
+        confidence = "Medium"
+    elif has_error and has_retry:
+        diag_type = "Error-Retry Exhaustion"
+        category = "Recovery Failure"
+        confidence = "Medium"
+    elif diff.output_diverged:
+        diag_type = "Execution Path Divergence"
+        category = "General"
+        confidence = "Low"
+    else:
+        diag_type = "Minor Path Variation"
+        category = "General"
+        confidence = "Low"
+
+    return diag_type, confidence, category
+
+
+def _suggest_fix(diag_type: str, root_var: str,
+                 diff: TraceDiffResult, narrative: str) -> list:
+    """Generate actionable fix suggestions based on error classification."""
+    fixes = []
+
+    if "Misroute" in diag_type or "Non-deterministic" in diag_type:
+        fixes.append("Add deterministic routing rules for the step where the misroute occurred")
+        fixes.append("Or introduce tool output validation: verify that the selected tool's")
+        fixes.append("  output matches expected schema before proceeding")
+
+    if "Retry Loop" in diag_type:
+        fixes.append("Add a fallback tool for the retry path instead of re-calling the same tool")
+        fixes.append("Or implement exponential backoff with a different strategy on each retry")
+
+    if "Input Sensitivity" in diag_type:
+        fixes.append("Add input normalization: map similar queries to canonical tool selections")
+        fixes.append("Or introduce a confidence threshold: only switch tools when signal is strong")
+
+    if root_var == "selected_tool":
+        # Specific fix for tool selection issues
+        fixes.append("Consider adding a tool selection guardrail:")
+        tools_involved = set()
+        if diff.run_a_path:
+            tools_involved.update(diff.run_a_path)
+        if diff.run_b_path:
+            tools_involved.update(diff.run_b_path)
+        tool_list = sorted(t for t in tools_involved if t not in ("llm",))
+        if tool_list:
+            fixes.append(f"  Define explicit preconditions for: {', '.join(tool_list[:3])}")
+
+    if not fixes:
+        fixes.append("Review the first divergence point and add a guard condition")
+        if diff.first_divergence:
+            fixes.append(f"  Specifically at: {diff.first_divergence.id}")
+
+    return fixes
+
+
+def _extract_root_cause(diff: TraceDiffResult, narrative: str) -> tuple:
+    """Extract root cause description, trigger variable, and values."""
+    root_cause = ""
+    trigger_var = ""
+    trigger_vals = ""
+
+    # Detect tool misroute pattern from narrative
+    tool_change = _detect_tool_misroute(narrative)
+    if tool_change:
+        root_cause = tool_change
+        # Find the trigger variable
+        for line in narrative.split("\n"):
+            line_s = line.strip()
+            if "selected_tool" in line_s and "var:" in line_s:
+                trigger_var = line_s.split("var:", 1)[1].strip()
+                break
+        return root_cause, trigger_var, trigger_vals
+
+    # Try to extract from narrative
+    rc_match = _extract_line(narrative, "Root cause:")
+    if rc_match:
+        root_cause = rc_match.strip()
+    caused_by = _extract_line(narrative, "caused by:")
+    if caused_by:
+        root_cause = f"{root_cause}\n  {caused_by.strip()}"
+
+    if not root_cause:
+        # Build from diff structure
+        if diff.first_divergence and diff.first_divergence.type != "none":
+            fd = diff.first_divergence
+            root_cause = f"Decision `{fd.id}` diverged"
+            if fd.run_a is not None and fd.run_b is not None:
+                root_cause += f":\n    Run A: {fd.run_a}\n    Run B: {fd.run_b}"
+
+        diverged_branches = [bd for bd in diff.branch_diffs if bd.diverged]
+        if diverged_branches:
+            for bd in diverged_branches:
+                root_cause = (f"Branch `{bd.condition}` took different paths:\n"
+                             f"    Run A: took '{bd.run_a_path}' path\n"
+                             f"    Run B: took '{bd.run_b_path}' path")
+
+    if not root_cause:
+        root_cause = diff.summary
+
+    # Extract trigger variable from narrative
+    for line in narrative.split("\n"):
+        line_s = line.strip()
+        if "var:" in line_s or "Root cause: variable change" in line_s:
+            if "var:" in line_s:
+                var_part = line_s.split("var:", 1)[1].strip()
+                trigger_var = var_part
+            break
+
+    # Check for exclusive paths
+    if not root_cause.strip():
+        step_diffs = [sd for sd in diff.step_diffs if sd.only_in]
+        if step_diffs:
+            sd = step_diffs[0]
+            this_run = "Run A" if sd.only_in == "run_a" else "Run B"
+            root_cause = f"Step `{sd.step_name}` only executed in {this_run}"
+
+    return root_cause, trigger_var, trigger_vals
+
+
+def _detect_tool_misroute(narrative: str) -> str:
+    """Detect if the root cause is an LLM tool selection error."""
+    tool_a = None
+    tool_b = None
+    for line in narrative.split("\n"):
+        line_s = line.strip()
+        if "selected_tool" in line_s and "var:" in line_s:
+            import re
+            match = re.search(r'"(\w+)"\s*.*?"(\w+)"', line_s)
+            if match:
+                tool_a, tool_b = match.group(1), match.group(2)
+                break
+
+    if tool_a and tool_b:
+        # Determine which tool was wrong by checking which path had errors
+        failed_a = "error" in narrative.lower() and "Run A" in narrative
+        return (f"LLM Router selected different tools:\n"
+                f"    Run A chose: `{tool_a}`\n"
+                f"    Run B chose: `{tool_b}`\n"
+                f"  This is a non-deterministic routing decision —\n"
+                f"  the same context produced different tool choices.")
+
+    # Check for plan-level diff
+    for line in narrative.split("\n"):
+        line_s = line.strip()
+        if "plan:" in line_s and "var:" in line_s:
+            import re
+            tools = re.findall(r"'tool':\s*'(\w+)'", line_s)
+            if len(tools) >= 2 and tools[0] != tools[1]:
+                return (f"LLM Router selected different tools:\n"
+                        f"    Run A chose: `{tools[0]}`\n"
+                        f"    Run B chose: `{tools[1]}`")
+
+    return ""
+
+
+def _extract_line(text: str, prefix: str) -> str:
+    """Extract the first line from text that starts with prefix."""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped
+    return ""
+
+
+def _build_cascade(diff: TraceDiffResult, narrative: str) -> list:
+    """Build a visual side-by-side cascade showing where paths diverged."""
+    lines = []
+    path_a = diff.run_a_path if diff.run_a_path else []
+    path_b = diff.run_b_path if diff.run_b_path else []
+
+    if not path_a and not path_b:
+        return []
+
+    # Detect divergence index — first position where paths differ
+    div_idx = None
+    for i in range(min(len(path_a), len(path_b))):
+        if path_a[i] != path_b[i]:
+            div_idx = i
+            break
+    if div_idx is None:
+        div_idx = min(len(path_a), len(path_b))
+
+    # Header
+    a_label = "Run A"
+    b_label = "Run B"
+    lines.append(f"  {a_label:40s} {b_label}")
+
+    # Show aligned steps
+    max_len = max(len(path_a), len(path_b))
+    shown = 0
+    for i in range(max_len):
+        if shown >= 10:
+            remaining = max_len - shown
+            if remaining > 0:
+                lines.append(f"  ... ({remaining} more steps)")
+            break
+
+        a_step = path_a[i] if i < len(path_a) else "(end)"
+        b_step = path_b[i] if i < len(path_b) else "(end)"
+
+        if i < div_idx:
+            # Same path
+            lines.append(f"  {a_step:40s} {b_step}")
+        elif i == div_idx:
+            # Divergence point
+            sep = "DIVERGED"
+            lines.append(f"  {'':-^78}")
+            lines.append(f"  {a_step:40s} {b_step}    <-- {sep}")
+            lines.append(f"  {'':-^78}")
+        else:
+            # After divergence
+            a_display = a_step if a_step != "(end)" else "(none)"
+            b_display = b_step if b_step != "(end)" else "(none)"
+            a_mark = ">> " if a_step != b_step and i < len(path_a) else "   "
+            b_mark = ">> " if a_step != b_step and i < len(path_b) else "   "
+            lines.append(f"  {a_mark}{a_display:<38s} {b_mark}{b_display}")
+        shown += 1
+
+    # Summary
+    extra_a = len(path_a) - div_idx if div_idx < len(path_a) else 0
+    extra_b = len(path_b) - div_idx if div_idx < len(path_b) else 0
+    if extra_a > 0:
+        lines.append(f"")
+        lines.append(f"  Run A had {extra_a} extra step(s) after divergence.")
+    if extra_b > 0:
+        lines.append(f"  Run B had {extra_b} extra step(s) after divergence.")
+
+    return lines
+
+
+def _build_why_explanation(diff: TraceDiffResult, narrative: str) -> list:
+    """Build a plain-language 'why' explanation."""
+    lines = []
+    narrative_lower = narrative.lower()
+
+    # Detect the failure archetype
+    is_misroute = "misrout" in narrative_lower or "selected_tool" in narrative_lower
+    is_error_cascade = narrative_lower.count("error") >= 2
+    is_threshold = "branch flip" in narrative_lower or "threshold" in narrative_lower
+
+    if is_misroute:
+        # Extract tool names from the path divergence
+        import re
+        only_a = set()
+        only_b = set()
+
+        # Get tool names from paths (these are cleaner than step diffs)
+        if diff.run_a_path and diff.run_b_path:
+            a_set = set(diff.run_a_path)
+            b_set = set(diff.run_b_path)
+            only_a = a_set - b_set
+            only_b = b_set - a_set
+
+        # Also try to parse tool names from narrative var lines
+        for line in narrative.split("\n"):
+            if "selected_tool" in line and "var:" in line:
+                match = re.search(r'"(\w+)"\s*.*?"(\w+)"', line)
+                if match:
+                    only_a = {match.group(1)}
+                    only_b = {match.group(2)}
+                    break
+
+        if only_a or only_b:
+            lines.append(f"The LLM router made a non-deterministic tool selection error.")
+            lines.append(f"")
+            if only_a:
+                lines.append(f"  Run A selected: {', '.join(sorted(only_a)[:3])}")
+            if only_b:
+                lines.append(f"  Run B selected: {', '.join(sorted(only_b)[:3])}")
+            lines.append(f"")
+            lines.append(f"This is the single decision that caused ALL downstream differences.")
+            if is_error_cascade:
+                lines.append(f"The wrong tool received incompatible arguments, triggering")
+                lines.append(f"a cascade of error-retry cycles that consumed the step budget.")
+
+    elif is_threshold:
+        lines.append(f"A threshold condition evaluated differently due to a small input change.")
+        lines.append(f"This type of 'butterfly effect' bug is common in agent pipelines")
+        lines.append(f"where numeric values cross decision boundaries.")
+    else:
+        # Generic: show what changed between runs
+        diverged_branches = [bd for bd in diff.branch_diffs if bd.diverged]
+        if diverged_branches:
+            bd = diverged_branches[0]
+            lines.append(f"The decision `{bd.condition}` took different paths:")
+            lines.append(f"  Run A: {bd.run_a_path}")
+            lines.append(f"  Run B: {bd.run_b_path}")
+            lines.append(f"")
+            lines.append(f"This single branch flip caused the agent to follow a")
+            lines.append(f"different execution path, producing a different result.")
+        elif diff.first_divergence:
+            fd = diff.first_divergence
+            lines.append(f"The first divergence occurred at `{fd.id}`.")
+            lines.append(f"All steps before this point were identical between runs.")
+
+    # Show result comparison
+    if diff.output_diverged:
+        lines.append(f"")
+        lines.append(f"Result:")
+        out_a = str(diff.output_a)[:100] if diff.output_a else "(none)"
+        out_b = str(diff.output_b)[:100] if diff.output_b else "(none)"
+        lines.append(f"  Run A: {out_a}")
+        lines.append(f"  Run B: {out_b}")
+
+    return lines
+
+
+def _build_diagnosis(diff: TraceDiffResult, narrative: str) -> list:
+    """Build a diagnosis with actionable insight."""
+    lines = []
+    narrative_lower = narrative.lower()
+
+    has_misroute = "misrout" in narrative_lower or "selected_tool" in narrative_lower
+    has_error = "error" in narrative_lower
+    has_retry = "retry" in narrative_lower
+
+    if has_misroute and has_error and has_retry:
+        lines.append("Pattern: LLM Misroute -> Error Cascade")
+        lines.append("The planner picked the wrong tool, which received incompatible")
+        lines.append("arguments and failed. The retry mechanism re-planned but picked")
+        lines.append("ANOTHER wrong tool, consuming the step budget with no progress.")
+    elif has_misroute:
+        lines.append("Pattern: Non-deterministic LLM Routing")
+        lines.append("The planner's tool selection is not deterministic — the same")
+        lines.append("context can produce different tool choices across runs.")
+        lines.append("Fix: Add deterministic routing rules for critical paths.")
+    elif has_error and has_retry:
+        lines.append("Pattern: Error-Retry Loop")
+        lines.append("The agent retried a failing operation but did not change its")
+        lines.append("approach, leading to repeated failures.")
+        lines.append("Fix: Add exponential backoff or tool fallback on retry.")
+
+    # Check output quality
+    if diff.output_diverged:
+        out_a = str(diff.output_a) if diff.output_a else ""
+        out_b = str(diff.output_b) if diff.output_b else ""
+        if "[FAIL]" in out_a or "[PARTIAL]" in out_a:
+            lines.append(f"Run A output is degraded: {out_a[:60]}...")
+        if "[FAIL]" in out_b or "[PARTIAL]" in out_b:
+            lines.append(f"Run B output is degraded: {out_b[:60]}...")
+
+    if not lines:
+        if diff.first_divergence:
+            lines.append(f"Divergence: {diff.first_divergence.id}")
+            lines.append(f"Description: {diff.first_divergence.description}")
+
+    return lines

@@ -1,0 +1,587 @@
+{
+  "trace_id": "trace_1777544189289",
+  "start_time": 1777544189.2890124,
+  "end_time": 1777544189.2890124,
+  "total_latency_ms": 0.0,
+  "runs": [
+    {
+      "id": "chain_1",
+      "name": "[CHAIN] BuggyAgent",
+      "run_type": "chain",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": null,
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    },
+    {
+      "id": "input_2",
+      "name": "[INPUT] input",
+      "run_type": "input",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    },
+    {
+      "id": "llm_3",
+      "name": "[LLM] classify_intent",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": ""
+      },
+      "outputs": {
+        "result": "weather_inquiry"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "llm_4",
+      "name": "[LLM] planner_llm",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": ""
+      },
+      "outputs": {
+        "result": "{\"tool\": \"weather_current\", \"args\": {\"city\": \"london\"}, \"reason\": \"Weather requested for london\"}"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "decision_5",
+      "name": "[Decision] route_to_weather_current",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "route_to_weather_current",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "execute_weather_current",
+          "try_other_tool"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "route_to_weather_current",
+        "condition_value": true,
+        "true_target": "execute_weather_current",
+        "false_target": "try_other_tool",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "tool_6",
+      "name": "[TOOL] weather_current",
+      "run_type": "tool",
+      "inputs": {
+        "tool": "weather_current",
+        "args": {
+          "args": {
+            "city": "london"
+          },
+          "misrouted": false
+        }
+      },
+      "outputs": {
+        "result": {
+          "tool": "weather_current",
+          "city": "london",
+          "error": false,
+          "temp": 12,
+          "condition": "rainy",
+          "humidity": 80,
+          "wind": 20,
+          "forecast": "continued rain, 11C"
+        }
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "tool"
+      ]
+    },
+    {
+      "id": "decision_7",
+      "name": "[Decision] need_activity_search",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "need_activity_search",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "search_activity",
+          "output_weather_only"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "need_activity_search",
+        "condition_value": true,
+        "true_target": "search_activity",
+        "false_target": "output_weather_only",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "llm_8",
+      "name": "[LLM] planner_llm",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": ""
+      },
+      "outputs": {
+        "result": "{\"tool\": \"safety_check\", \"args\": {\"condition\": \"rainy\"}, \"reason\": \"Risky condition (rainy), checking safety before activity\"}"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "decision_9",
+      "name": "[Decision] route_to_safety_check",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "route_to_safety_check",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "execute_safety_check",
+          "try_other_tool"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "route_to_safety_check",
+        "condition_value": true,
+        "true_target": "execute_safety_check",
+        "false_target": "try_other_tool",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "tool_10",
+      "name": "[TOOL] safety_check",
+      "run_type": "tool",
+      "inputs": {
+        "tool": "safety_check",
+        "args": {
+          "args": {
+            "condition": "rainy"
+          },
+          "misrouted": false
+        }
+      },
+      "outputs": {
+        "result": {
+          "tool": "safety_check",
+          "condition": "rainy",
+          "warning": "Exercise caution. Slippery surfaces, reduced visibility.",
+          "risk_level": "high",
+          "error": false
+        }
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "tool"
+      ]
+    },
+    {
+      "id": "decision_11",
+      "name": "[Decision] risk_is_acceptable",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "risk_is_acceptable",
+        "expected_value": false
+      },
+      "outputs": {
+        "branch_to": [
+          "summarize",
+          "output_with_warning"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "risk_is_acceptable",
+        "condition_value": false,
+        "true_target": "summarize",
+        "false_target": "output_with_warning",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "llm_12",
+      "name": "[LLM] planner_llm",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": ""
+      },
+      "outputs": {
+        "result": "{\"tool\": \"activity_search\", \"args\": {\"activity\": \"cycling\", \"condition\": \"rainy\"}, \"reason\": \"Weather + safety done, searching cycling advice\"}"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "decision_13",
+      "name": "[Decision] route_to_activity_search",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "route_to_activity_search",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "execute_activity_search",
+          "try_other_tool"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "route_to_activity_search",
+        "condition_value": true,
+        "true_target": "execute_activity_search",
+        "false_target": "try_other_tool",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "tool_14",
+      "name": "[TOOL] activity_search",
+      "run_type": "tool",
+      "inputs": {
+        "tool": "activity_search",
+        "args": {
+          "args": {
+            "activity": "cycling",
+            "condition": "rainy"
+          },
+          "misrouted": false
+        }
+      },
+      "outputs": {
+        "result": {
+          "tool": "activity_search",
+          "activity": "cycling",
+          "condition": "rainy",
+          "advice": "Cycling dangerous. Roads slippery, visibility low.",
+          "error": false
+        }
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "tool"
+      ]
+    },
+    {
+      "id": "decision_15",
+      "name": "[Decision] needs_safety_check",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "needs_safety_check",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "check_safety",
+          "summarize_directly"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "needs_safety_check",
+        "condition_value": true,
+        "true_target": "check_safety",
+        "false_target": "summarize_directly",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "llm_16",
+      "name": "[LLM] planner_llm",
+      "run_type": "llm",
+      "inputs": {
+        "prompt": ""
+      },
+      "outputs": {
+        "result": "{\"tool\": \"summarize\", \"args\": {\"findings\": {\"weather\": {\"tool\": \"weather_current\", \"city\": \"london\", \"error\": false, \"temp\": 12, \"condition\": \"rainy\", \"humidity\": 80, \"wind\": 20, \"forecast\": \"continued rain, 11C\"}, \"activity\": {\"tool\": \"activity_search\", \"activity\": \"cycling\", \"condition\": \"rainy\", \"advice\": \"Cycling dangerous. Roads slippery, visibility low.\", \"error\": false}, \"safety\": {\"tool\": \"safety_check\", \"condition\": \"rainy\", \"warning\": \"Exercise caution. Slippery surfaces, reduced visibility.\", \"risk_level\": \"high\", \"error\": false}}}, \"reason\": \"All data collected, summarizing final recommendation\"}"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "llm"
+      ]
+    },
+    {
+      "id": "decision_17",
+      "name": "[Decision] route_to_summarize",
+      "run_type": "decision",
+      "inputs": {
+        "condition": "route_to_summarize",
+        "expected_value": true
+      },
+      "outputs": {
+        "branch_to": [
+          "execute_summarize",
+          "try_other_tool"
+        ]
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "branch_info": {
+        "condition": "route_to_summarize",
+        "condition_value": true,
+        "true_target": "execute_summarize",
+        "false_target": "try_other_tool",
+        "merge_node": null,
+        "true_path_length": 0,
+        "false_path_length": 0
+      },
+      "tags": [
+        "branch"
+      ]
+    },
+    {
+      "id": "tool_18",
+      "name": "[TOOL] summarize",
+      "run_type": "tool",
+      "inputs": {
+        "tool": "summarize",
+        "args": {
+          "args": {
+            "findings": {
+              "weather": {
+                "tool": "weather_current",
+                "city": "london",
+                "error": false,
+                "temp": 12,
+                "condition": "rainy",
+                "humidity": 80,
+                "wind": 20,
+                "forecast": "continued rain, 11C"
+              },
+              "activity": {
+                "tool": "activity_search",
+                "activity": "cycling",
+                "condition": "rainy",
+                "advice": "Cycling dangerous. Roads slippery, visibility low.",
+                "error": false
+              },
+              "safety": {
+                "tool": "safety_check",
+                "condition": "rainy",
+                "warning": "Exercise caution. Slippery surfaces, reduced visibility.",
+                "risk_level": "high",
+                "error": false
+              }
+            }
+          },
+          "misrouted": false
+        }
+      },
+      "outputs": {
+        "result": {
+          "tool": "summarize",
+          "summary": "{'weather': {'tool': 'weather_current', 'city': 'london', 'error': False, 'temp': 12, 'condition': 'rainy', 'humidity': 80, 'wind': 20, 'forecast': 'continued rain, 11C'}, 'activity': {'tool': 'activi",
+          "error": false
+        }
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "tool"
+      ]
+    },
+    {
+      "id": "output_19",
+      "name": "[OUTPUT] output",
+      "run_type": "output",
+      "inputs": {},
+      "outputs": {
+        "raw": "['_', '_']"
+      },
+      "parent_run_id": "chain_1",
+      "start_time": 1777544189.2890124,
+      "end_time": 1777544189.2890124,
+      "latency_ms": 0.0,
+      "status": "success",
+      "tags": [
+        "chain"
+      ]
+    }
+  ],
+  "branches": [
+    {
+      "branch_id": "br_decision_5",
+      "branch_step": "decision_5",
+      "condition": "route_to_weather_current",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_7",
+      "branch_step": "decision_7",
+      "condition": "need_activity_search",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_9",
+      "branch_step": "decision_9",
+      "condition": "route_to_safety_check",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_11",
+      "branch_step": "decision_11",
+      "condition": "risk_is_acceptable",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_13",
+      "branch_step": "decision_13",
+      "condition": "route_to_activity_search",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_15",
+      "branch_step": "decision_15",
+      "condition": "needs_safety_check",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    },
+    {
+      "branch_id": "br_decision_17",
+      "branch_step": "decision_17",
+      "condition": "route_to_summarize",
+      "true_path": [],
+      "false_path": [],
+      "merge_step": null
+    }
+  ]
+}

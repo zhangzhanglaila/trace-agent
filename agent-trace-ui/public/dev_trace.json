@@ -1,0 +1,453 @@
+{
+  "verdict": "Both runs took different paths because `tool_result` diverged (`{'query': 'AI safety regulations', 'results': [...` vs `{'query': 'database performance', 'results': [{...`), producing different final outputs.",
+  "diagnosis": {
+    "type": "Execution Path Divergence",
+    "confidence": "Low",
+    "category": "General"
+  },
+  "root_cause": {
+    "variable": "tool_result",
+    "run_a": "{'query': 'AI safety regulations', 'results': [...",
+    "run_b": "{'query': 'database performance', 'results': [{...",
+    "source": "tool `tool` output"
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "chain_1",
+        "name": "[CHAIN] ResearchAgent",
+        "type": "tool",
+        "label": "[CHAIN] ResearchAgent",
+        "status": "success",
+        "inputs": {},
+        "outputs": {
+          "raw": "['_', '_']"
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 0
+      },
+      {
+        "id": "input_2",
+        "name": "[INPUT] input",
+        "type": "tool",
+        "label": "[INPUT] input",
+        "status": "success",
+        "inputs": {},
+        "outputs": {
+          "raw": "['_', '_']"
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 1
+      },
+      {
+        "id": "tool_3",
+        "name": "[TOOL] web_search",
+        "type": "tool",
+        "label": "[TOOL] web_search",
+        "status": "success",
+        "inputs": {
+          "tool": "web_search",
+          "args": {
+            "query": "database performance"
+          }
+        },
+        "outputs": {
+          "result": {
+            "query": "database performance",
+            "results": [
+              {
+                "title": "PostgreSQL 17 Released",
+                "url": "/db/postgres17",
+                "snippet": "New features in PostgreSQL..."
+              },
+              {
+                "title": "NoSQL vs SQL in 2025",
+                "url": "/db/comparison",
+                "snippet": "Choosing the right database..."
+              }
+            ],
+            "total_count": 2,
+            "search_time_ms": 107
+          }
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 2
+      },
+      {
+        "id": "tool_4",
+        "name": "[TOOL] extract_facts",
+        "type": "tool",
+        "label": "[TOOL] extract_facts",
+        "status": "success",
+        "inputs": {
+          "tool": "extract_facts",
+          "args": {
+            "search_results": [
+              {
+                "title": "PostgreSQL 17 Released",
+                "url": "/db/postgres17",
+                "snippet": "New features in PostgreSQL..."
+              },
+              {
+                "title": "NoSQL vs SQL in 2025",
+                "url": "/db/comparison",
+                "snippet": "Choosing the right database..."
+              }
+            ]
+          }
+        },
+        "outputs": {
+          "result": {
+            "facts": [
+              {
+                "source": "PostgreSQL 17 Released",
+                "claim": "New features in PostgreSQL...",
+                "confidence": 0.71
+              },
+              {
+                "source": "NoSQL vs SQL in 2025",
+                "claim": "Choosing the right database...",
+                "confidence": 0.91
+              }
+            ],
+            "count": 2,
+            "status": "success",
+            "extraction_time_ms": 29
+          }
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": true,
+        "step_index": 3
+      },
+      {
+        "id": "tool_5",
+        "name": "[TOOL] verify_facts",
+        "type": "tool",
+        "label": "[TOOL] verify_facts",
+        "status": "success",
+        "inputs": {
+          "tool": "verify_facts",
+          "args": {
+            "facts": [
+              {
+                "source": "PostgreSQL 17 Released",
+                "claim": "New features in PostgreSQL...",
+                "confidence": 0.71
+              },
+              {
+                "source": "NoSQL vs SQL in 2025",
+                "claim": "Choosing the right database...",
+                "confidence": 0.91
+              }
+            ]
+          }
+        },
+        "outputs": {
+          "result": "{'verified': [{'source': 'PostgreSQL 17 Released', 'claim': 'New features in PostgreSQL...', 'confidence': 0.71, 'kb_match': 'postgresql', 'kb_data': {'version': '17', 'type': 'relational', 'license': 'open source'}}], 'unverified': [{'source': 'NoSQL vs SQL in 2025', 'claim': 'Choosing the right da..."
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": true,
+        "step_index": 4
+      },
+      {
+        "id": "tool_6",
+        "name": "[TOOL] analyze_sentiment",
+        "type": "tool",
+        "label": "[TOOL] analyze_sentiment",
+        "status": "success",
+        "inputs": {
+          "tool": "analyze_sentiment",
+          "args": {
+            "facts": [
+              {
+                "source": "PostgreSQL 17 Released",
+                "claim": "New features in PostgreSQL...",
+                "confidence": 0.71
+              },
+              {
+                "source": "NoSQL vs SQL in 2025",
+                "claim": "Choosing the right database...",
+                "confidence": 0.91
+              }
+            ]
+          }
+        },
+        "outputs": {
+          "result": {
+            "sentiment": "positive",
+            "distribution": {
+              "positive": 1,
+              "negative": 0,
+              "neutral": 1
+            },
+            "confidence": 0.5
+          }
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": true,
+        "step_index": 5,
+        "is_divergence_point": true
+      },
+      {
+        "id": "tool_7",
+        "name": "[TOOL] summarize",
+        "type": "tool",
+        "label": "[TOOL] summarize",
+        "status": "success",
+        "inputs": {
+          "tool": "summarize",
+          "args": "{'facts': {'facts': [{'source': 'PostgreSQL 17 Released', 'claim': 'New features in PostgreSQL...', 'confidence': 0.71}, {'source': 'NoSQL vs SQL in 2025', 'claim': 'Choosing the right database...', 'confidence': 0.91}], 'count': 2, 'status': 'success', 'extraction_time_ms': 29}, 'verified': {'verif..."
+        },
+        "outputs": {
+          "result": "{'summary': \"Research on 'database performance' found 2 facts (1 verified against knowledge base). Overall sentiment: positive. Key findings: - [0.71] New features in PostgreSQL...; - [0.91] Choosing the right database...\", 'source': 'facts', 'fact_count': 2, 'verified_count': 1, 'sentiment': 'posit..."
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 6
+      },
+      {
+        "id": "output_8",
+        "name": "[OUTPUT] output",
+        "type": "output",
+        "label": "Output",
+        "status": "success",
+        "inputs": {},
+        "outputs": {
+          "raw": "['_', '_']"
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 7
+      }
+    ],
+    "edges": [
+      {
+        "source": "chain_1",
+        "target": "input_2",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "input_2",
+        "target": "tool_3",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "tool_3",
+        "target": "tool_4",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "tool_4",
+        "target": "tool_5",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "tool_5",
+        "target": "tool_6",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "tool_6",
+        "target": "tool_7",
+        "type": "sequential",
+        "style": "solid"
+      },
+      {
+        "source": "tool_7",
+        "target": "output_8",
+        "type": "sequential",
+        "style": "solid"
+      }
+    ],
+    "primary_run": "run_b",
+    "secondary_nodes": [
+      {
+        "id": "chain_1",
+        "name": "[CHAIN] ResearchAgent",
+        "type": "tool",
+        "label": "[CHAIN] ResearchAgent",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "input_2",
+        "name": "[INPUT] input",
+        "type": "tool",
+        "label": "[INPUT] input",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "tool_3",
+        "name": "[TOOL] web_search",
+        "type": "tool",
+        "label": "[TOOL] web_search",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "tool_4",
+        "name": "[TOOL] summarize",
+        "type": "tool",
+        "label": "[TOOL] summarize",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "output_5",
+        "name": "[OUTPUT] output",
+        "type": "output",
+        "label": "Output",
+        "status": "success",
+        "error": null
+      }
+    ]
+  },
+  "diff": {
+    "first_divergence": {
+      "type": "step",
+      "id": "[TOOL] analyze_sentiment",
+      "description": "Step '[TOOL] analyze_sentiment' only exists in run_b",
+      "run_a": "absent",
+      "run_b": "present"
+    },
+    "step_diffs": [
+      {
+        "step_name": "[CHAIN] ResearchAgent",
+        "only_in": null,
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": false
+      },
+      {
+        "step_name": "[INPUT] input",
+        "only_in": null,
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": false
+      },
+      {
+        "step_name": "[OUTPUT] output",
+        "only_in": null,
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": false
+      },
+      {
+        "step_name": "[TOOL] analyze_sentiment",
+        "only_in": "run_b",
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": true
+      },
+      {
+        "step_name": "[TOOL] extract_facts",
+        "only_in": "run_b",
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": true
+      },
+      {
+        "step_name": "[TOOL] summarize",
+        "only_in": null,
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": false
+      },
+      {
+        "step_name": "[TOOL] verify_facts",
+        "only_in": "run_b",
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": true
+      },
+      {
+        "step_name": "[TOOL] web_search",
+        "only_in": null,
+        "run_a_status": null,
+        "run_b_status": null,
+        "run_a_error": null,
+        "run_b_error": null,
+        "diverged": false
+      }
+    ],
+    "branch_diffs": [],
+    "path_impact": [
+      {
+        "index": 0,
+        "run_a": "web_search",
+        "run_b": "web_search",
+        "diverged": false
+      },
+      {
+        "index": 1,
+        "run_a": "summarize",
+        "run_b": "extract_facts",
+        "diverged": true
+      },
+      {
+        "index": 2,
+        "run_a": null,
+        "run_b": "verify_facts",
+        "diverged": true
+      },
+      {
+        "index": 3,
+        "run_a": null,
+        "run_b": "analyze_sentiment",
+        "diverged": true
+      },
+      {
+        "index": 4,
+        "run_a": null,
+        "run_b": "summarize",
+        "diverged": true
+      }
+    ],
+    "has_diverged": true,
+    "output_diverged": true
+  },
+  "output": {
+    "run_a": "{'summary': 'Based on initial search results, the topic appears to be active. New framework for AI governance... Best practices for deploying ML... Next-gen attention mechanisms... [WARNING: summary p",
+    "run_b": "{'summary': \"Research on 'database performance' found 2 facts (1 verified against knowledge base). Overall sentiment: positive. Key findings: - [0.71] New features in PostgreSQL...; - [0.91] Choosing ",
+    "diverged": true
+  },
+  "fix_suggestion": "Review the first divergence point and add a guard condition\n  Specifically at: [TOOL] analyze_sentiment",
+  "explanation": "Both runs took different paths because `tool_result` diverged (`{'query': 'AI safety regulations', 'results': [...` vs `{'query': 'database performance', 'results': [{...`), producing different final outputs The first divergence occurred at \"[TOOL] analyze_sentiment\": Run A used absent, but Run B used present. Root cause: variable `tool_result` was `{'query': 'AI safety regulations', 'results': [...` in Run A but `{'query': 'database performance', 'results': [{...` in Run B. This divergence caused the final outputs to differ.",
+  "meta": {
+    "trace_id_a": "trace_1777572794288",
+    "trace_id_b": "trace_1777572794461",
+    "run_a_steps": 5,
+    "run_b_steps": 8
+  }
+}
