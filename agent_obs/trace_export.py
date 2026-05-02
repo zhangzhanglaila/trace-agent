@@ -271,8 +271,9 @@ class TraceExporter:
             }
             run_type = run_type_map.get(step_type, "chain")
 
-        # Build inputs/outputs
-        inputs, outputs = self._extract_io(step, step_type, instr)
+        # Build inputs/outputs — use run_type (semantic) not step_type (raw)
+        io_type = run_type if run_type in ("llm", "tool", "branch", "merge", "output") else step_type
+        inputs, outputs = self._extract_io(step, io_type, instr)
 
         # Branch info for branch steps
         branch_info = None
@@ -344,8 +345,11 @@ class TraceExporter:
             outputs["merged"] = True
         elif step_type == "output":
             inputs["var"] = step.get("var", "")
-            inputs["result"] = step.get("inputs", {}).get("result", "")
-            outputs["value"] = step.get("value", "")
+            # Try inputs.result, then outputs.result (set by end_span on TracedAgent)
+            result = (step.get("inputs", {}).get("result") or
+                      step.get("outputs", {}).get("result") or "")
+            inputs["result"] = result
+            outputs["value"] = step.get("value") or result
         else:
             outputs["raw"] = str(instr.args) if instr else ""
 

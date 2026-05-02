@@ -1079,8 +1079,8 @@ class TracedAgent:
                 raise
 
             ctx.start_span("output", SEM.OUTPUT,
-                          inputs={"result": str(result)[:500]})
-            ctx.end_span()
+                          inputs={"query": str(input_data)[:200]})
+            ctx.end_span(outputs={"result": str(result)[:500]})
 
             return result
 

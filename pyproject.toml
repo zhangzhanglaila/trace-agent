@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "agenttrace"
+version = "1.0.0"
+description = "Chrome DevTools for AI Agents — causal graph diff explaining WHY agents diverge"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["ai-agent", "debugging", "observability", "tracing", "langchain", "openai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/agenttrace/agenttrace"
+Repository = "https://github.com/agenttrace/agenttrace"
+
+[tool.setuptools.packages.find]
+include = ["agent_obs*", "agenttrace*"]

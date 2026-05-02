@@ -266,6 +266,7 @@ class TraceDiffer:
                     sd.only_in = "run_b"
                     sd.diverged = True
                 elif ra and rb:
+                    # Status or error divergence
                     if ra.status != rb.status:
                         sd.diverged = True
                         sd.run_a_status = ra.status
@@ -274,10 +275,31 @@ class TraceDiffer:
                         sd.diverged = True
                         sd.run_a_error = ra.error
                         sd.run_b_error = rb.error
+                    # Output value divergence (catches cases where status is
+                    # "success" in both but result values differ semantically)
+                    sd.run_a_output = ra.outputs
+                    sd.run_b_output = rb.outputs
+                    if self._outputs_meaningfully_differ(ra.outputs, rb.outputs):
+                        sd.diverged = True
                     # Branch value differs → covered by branch diff, don't flag as step diff
                 diffs.append(sd)
 
         return diffs
+
+    @staticmethod
+    def _outputs_meaningfully_differ(out_a, out_b) -> bool:
+        """Compare step outputs, ignoring only trivial identity differences."""
+        if out_a == out_b:
+            return False
+        if out_a is None or out_b is None:
+            return out_a is not None or out_b is not None
+        # Compare the 'result' key for dict outputs (the canonical output)
+        if isinstance(out_a, dict) and isinstance(out_b, dict):
+            ra = out_a.get("result")
+            rb = out_b.get("result")
+            if ra is not None or rb is not None:
+                return ra != rb
+        return out_a != out_b
 
     def _find_first_divergence(
         self, branch_diffs: List[BranchDiff], step_diffs: List[StepDiff]
@@ -315,7 +337,24 @@ class TraceDiffer:
                     run_b="present" if sd.only_in == "run_b" else "absent",
                 )
 
-        # 3. No divergence
+        # 3. Check step output divergence (same step, different values)
+        for sd in step_diffs:
+            if sd.diverged and sd.run_a_output is not None and sd.run_b_output is not None:
+                # Build a meaningful description from the output diff
+                a_val = _brief(sd.run_a_output)
+                b_val = _brief(sd.run_b_output)
+                return FirstDivergence(
+                    type="value",
+                    id=sd.step_name,
+                    description=(
+                        f"Step '{sd.step_name}' produced different results: "
+                        f"run_a → {a_val}, run_b → {b_val}"
+                    ),
+                    run_a=a_val,
+                    run_b=b_val,
+                )
+
+        # 4. No divergence
         return FirstDivergence(
             type="none",
             id="",
@@ -728,6 +767,23 @@ def render_causal_verdict(diff: TraceDiffResult) -> str:
 # Verdict + Variable-level helpers (product-ready upgrades)
 # ============================================================
 
+def _brief(val) -> str:
+    """Short human-readable summary of a value for divergence descriptions."""
+    if isinstance(val, dict):
+        result = val.get("result", val)
+        if isinstance(result, dict):
+            # Show key fields concisely
+            parts = []
+            for k, v in result.items():
+                if k in ("recommendation", "note", "plan"):
+                    parts.append(f"{k}={str(v)[:60]}")
+                else:
+                    parts.append(f"{k}={_brief(v)}")
+            return "{" + ", ".join(parts[:4]) + "}"
+        return str(result)[:80]
+    return str(val)[:80]
+
+
 def _build_verdict(diff: TraceDiffResult, narrative: str) -> str:
     """Build a one-line human-readable verdict — the most important output."""
     output_a = str(diff.output_a)[:80] if diff.output_a else "no output"
@@ -904,23 +960,33 @@ def _classify_error(diff: TraceDiffResult, narrative: str) -> tuple:
     has_fail_output = "[FAIL]" in output_a or "[FAIL]" in output_b
 
     # ── Classify ──
+    # Check for explicit root cause variable with downstream impact
+    rc_var, _, _ = _extract_root_cause(diff, narrative)
+    has_root_cause = bool(rc_var)
+    has_partial = "[PARTIAL]" in output_a or "[PARTIAL]" in output_b
+
     if has_explicit_misroute and has_error:
-        # The trace explicitly recorded a misroute → LLM hallucination
         diag_type = "LLM Hallucination → Error Cascade"
         category = "Planning Error"
         confidence = "High"
     elif has_error and has_retry and has_fail_output:
-        # Error triggered retries, and the output is degraded
         diag_type = "Error-Retry Loop (Missing Fallback)"
         category = "Recovery Failure"
         confidence = "High" if error_count >= 3 else "Medium"
+    elif has_root_cause and has_partial:
+        # Root cause variable identified with partial output → high confidence
+        diag_type = "Tool Output Ambiguity → Wrong Default"
+        category = "Edge Case Handling"
+        confidence = "High"
+    elif has_root_cause:
+        diag_type = "Variable Divergence → Path Split"
+        category = "Input Sensitivity"
+        confidence = "Medium"
     elif has_selected_tool and not has_error:
-        # Different tools selected, but no errors → input-driven divergence
         diag_type = "Input-Driven Tool Selection"
         category = "Input Sensitivity"
         confidence = "High"
     elif has_selected_tool and has_error:
-        # Tool selection diverged and errors occurred (but no explicit misroute recorded)
         diag_type = "Tool Selection Divergence"
         category = "Planning Gap"
         confidence = "Medium"
@@ -944,6 +1010,11 @@ def _suggest_fix(diag_type: str, root_var: str,
                  diff: TraceDiffResult, narrative: str) -> list:
     """Generate actionable fix suggestions based on error classification."""
     fixes = []
+
+    if "Tool Output Ambiguity" in diag_type:
+        fixes.append("Add input validation on tool outputs before routing decisions")
+        fixes.append(f"Check `{root_var}` for edge cases (empty, null, unexpected format)")
+        fixes.append("Default to a safe fallback when confidence is low or data is missing")
 
     if "Misroute" in diag_type or "Non-deterministic" in diag_type:
         fixes.append("Add deterministic routing rules for the step where the misroute occurred")

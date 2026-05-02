@@ -52,26 +52,23 @@ def _cleanup_stale_agents(ttl: float = 30.0):
 
 
 def build_trace(bug_enabled: bool = True) -> str:
-    """Run the Travel Planner agent and return unified JSON."""
+    """Run the LangChain Travel Agent and return unified JSON."""
     examples_dir = str(ROOT.parent / "examples")
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
-    from examples.travel_planner import TravelPlanner
+    from examples.langchain_travel_agent import LangChainTravelAgent
     from agent_obs.trace_core import TracedAgent, explain_diff
 
-    import examples.travel_planner as tp
-    tp.LLM_MISROUTE_ENABLED = bug_enabled
-
-    # Run A: Tokyo (always correct)
-    agent_a = TravelPlanner(enable_bug=False, max_steps=8)
+    # Run A: Tokyo (always correct — has real weather data)
+    agent_a = LangChainTravelAgent(enable_bug=False)
     traced_a = TracedAgent(agent_a, out_dir=".")
     traced_a.run("Plan a trip to Tokyo for hiking")
     export_a = TraceExport.from_file(traced_a.last_trace_path)
 
-    # Run B: Paris (bug if enabled)
-    agent_b = TravelPlanner(enable_bug=bug_enabled, max_steps=5 if bug_enabled else 8)
+    # Run B: Mars (no weather data — triggers bug if enabled)
+    agent_b = LangChainTravelAgent(enable_bug=bug_enabled)
     traced_b = TracedAgent(agent_b, out_dir=".")
-    traced_b.run("Plan a trip to Paris for hiking")
+    traced_b.run("Plan a trip to Mars for hiking")
     export_b = TraceExport.from_file(traced_b.last_trace_path)
 
     # Diff
@@ -130,12 +127,10 @@ def build_trace_custom(bug_enabled: bool = True, input_a: str = "", input_b: str
         agent_a = _find_agent(_load_module(abs_path), obj_ref)
         agent_b = _find_agent(_load_module(abs_path), obj_ref)
     else:
-        # ── Default: built-in TravelPlanner demo ──
-        import examples.travel_planner as tp
-        from examples.travel_planner import TravelPlanner
-        tp.LLM_MISROUTE_ENABLED = bug_enabled
-        agent_a = TravelPlanner(enable_bug=False, max_steps=8)
-        agent_b = TravelPlanner(enable_bug=bug_enabled, max_steps=5 if bug_enabled else 8)
+        # ── Default: built-in LangChain-style Travel Agent demo ──
+        from examples.langchain_travel_agent import LangChainTravelAgent
+        agent_a = LangChainTravelAgent(enable_bug=False)
+        agent_b = LangChainTravelAgent(enable_bug=bug_enabled)
 
     traced_a = TracedAgent(agent_a, out_dir=".")
     traced_a.run(input_a)
@@ -163,30 +158,29 @@ def build_trace_custom(bug_enabled: bool = True, input_a: str = "", input_b: str
 
 
 def build_what_if() -> str:
-    """Generate a counterfactual Run C."""
+    """Generate a counterfactual Run C (bug fixed)."""
     examples_dir = str(ROOT.parent / "examples")
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
-    from examples.travel_planner import TravelPlanner
+    from examples.langchain_travel_agent import LangChainTravelAgent
     from agent_obs.trace_core import TracedAgent, explain_diff
 
-    import examples.travel_planner as tp
-    tp.LLM_MISROUTE_ENABLED = True
-
-    agent_a = TravelPlanner(enable_bug=False, max_steps=8)
+    # Run A: Tokyo (correct)
+    agent_a = LangChainTravelAgent(enable_bug=False)
     traced_a = TracedAgent(agent_a, out_dir=".")
     traced_a.run("Plan a trip to Tokyo for hiking")
     export_a = TraceExport.from_file(traced_a.last_trace_path)
 
-    agent_b = TravelPlanner(enable_bug=True, max_steps=5)
+    # Run B: Mars with bug (misroutes to outdoor)
+    agent_b = LangChainTravelAgent(enable_bug=True)
     traced_b = TracedAgent(agent_b, out_dir=".")
-    traced_b.run("Plan a trip to Paris for hiking")
+    traced_b.run("Plan a trip to Mars for hiking")
     export_b = TraceExport.from_file(traced_b.last_trace_path)
 
-    tp.LLM_MISROUTE_ENABLED = False
-    agent_c = TravelPlanner(enable_bug=False, max_steps=8)
+    # Run C: Mars without bug (correct fallback → indoor)
+    agent_c = LangChainTravelAgent(enable_bug=False)
     traced_c = TracedAgent(agent_c, out_dir=".")
-    traced_c.run("Plan a trip to Paris for hiking")
+    traced_c.run("Plan a trip to Mars for hiking")
     export_c = TraceExport.from_file(traced_c.last_trace_path)
 
     differ_ab = TraceDiffer(export_a, export_b)
@@ -214,9 +208,9 @@ def build_what_if() -> str:
             },
             "run_b_output": str(traced_b._agent.run("Plan a trip to Paris for hiking")),
             "fix_description": (
-                "If the LLM had selected `activity_search` instead of `summarize` "
-                "at step 2, the agent would have produced a complete travel plan "
-                "instead of failing with an incomplete plan error."
+                "If the router had treated empty weather condition as 'unknown' "
+                "(defaulting to indoor), the agent would have produced a complete "
+                "indoor travel plan instead of a failed outdoor attempt."
             ),
             "would_fix": diff_ab.output_diverged,
         },

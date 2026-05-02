@@ -39,30 +39,26 @@ def generate_trace(bug_enabled: bool = True) -> bool:
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "examples"))
 
-    from examples.travel_planner import TravelPlanner
+    from examples.langchain_travel_agent import LangChainTravelAgent
     from agent_obs.trace_core import TracedAgent, explain_diff
     from agent_obs.trace_export import TraceExport
     from agent_obs.trace_diff import TraceDiffer
     from agent_obs.frontend_adapter import adapt_diff_result
 
-    # If bug is off, also set LLM_MISROUTE_ENABLED = False
-    import examples.travel_planner as tp
-    tp.LLM_MISROUTE_ENABLED = bug_enabled
+    print(f"  Bug injection: {'ON  (weather ambiguity → wrong activity type → cascade fail)' if bug_enabled else 'OFF (baseline — both runs correct)'}")
 
-    print(f"  Bug injection: {'ON  (LLM will misroute)' if bug_enabled else 'OFF (baseline — both runs correct)'}")
-
-    # Run A: Tokyo (always correct)
-    print("  [Run A] Tokyo — correct path...")
-    agent_a = TravelPlanner(enable_bug=False, max_steps=8)
+    # Run A: Tokyo (always correct — has real weather data)
+    print("  [Run A] Tokyo — has weather data, agent works correctly...")
+    agent_a = LangChainTravelAgent(enable_bug=False)
     traced_a = TracedAgent(agent_a, out_dir=".")
     result_a = traced_a.run("Plan a trip to Tokyo for hiking")
     print(f"    => {str(result_a)[:100]}")
 
-    # Run B: Paris (bug if enabled)
-    print(f"  [Run B] Paris — {'bug active' if bug_enabled else 'correct path'}...")
-    agent_b = TravelPlanner(enable_bug=bug_enabled, max_steps=5 if bug_enabled else 8)
+    # Run B: Mars (no weather data — triggers bug if enabled)
+    print(f"  [Run B] Mars — no weather data, {'ambiguity triggers bug' if bug_enabled else 'correct fallback'}...")
+    agent_b = LangChainTravelAgent(enable_bug=bug_enabled)
     traced_b = TracedAgent(agent_b, out_dir=".")
-    result_b = traced_b.run("Plan a trip to Paris for hiking")
+    result_b = traced_b.run("Plan a trip to Mars for hiking")
     print(f"    => {str(result_b)[:100]}")
 
     # Diff
