@@ -43,24 +43,18 @@ enable()
 
 打开 `http://127.0.0.1:8765`，点击 **运行 Demo**，不到 30 秒你会看到：
 
-```
-======================================================
-  [!] DETECTED BUG
-
-  [What Happened]
-  Agent diverged at "should I search activities?":
-  Run A took the search path, Run B skipped it.
-
-  [Root Cause]
-  weather current result:
-    Run A -> "clear"  ·  Run B -> "rain"
-  This variable caused the entire chain to fork.
-
-  [Impact]
-  Divergence point: routing  ·  Run B lost activity recs
-         ↓ View Full Analysis
-======================================================
-```
+> **🔴 检测到 Bug**
+>
+> **📖 发生了什么**
+> Agent 在「决定是否搜索活动」这一步分叉了：运行 A 走了搜索路径，运行 B 直接跳过。
+>
+> **🔍 根因**
+> `weather current result`：运行 A → "clear"，运行 B → "rain"
+> 就是这个变量导致了整条链路的分叉。
+>
+> **💡 影响范围**
+> 分叉点：routing 决策 · 运行 B 缺失了活动推荐
+> ↓ 查看完整分析
 
 不需要配置、不需要 API Key、不需要改代码。第一次打开就能看到一个**真实的 Bug、它的根因、以及修复方向**。
 
@@ -162,33 +156,30 @@ auto_trace()  # 自动 patch OpenAI + LangChain SDK
 ## 🏗️ 架构总览
 
 ```
-                               AgentTrace
-+------------------------------------------------------------+
-|                                                            |
-|  Agent Code --> TracedAgent --> TraceCapture                |
-|                                         |                  |
-|                                         v                  |
-|                                  ExecutionGraph             |
-|                                (SSA + CFG + phi-nodes)      |
-|                                         |                  |
-|                      +------------------+--------------+   |
-|                      v                  v              v   |
-|               SemanticResolver    AgentIR       SCM Engine  |
-|              (Lattice-based)     (why/what_if)  (Causal)   |
-|                      |                  |              |   |
-|                      +------------------+--------------+   |
-|                                         |                  |
-|                                         v                  |
-|                                  TraceDiffResult            |
-|                            (root cause + impact + fix)     |
-|                                         |                  |
-|                                         v                  |
-|                           +---------------------+          |
-|                           |    DevTools UI       |          |
-|                           | (Vue 3 + ECharts)    |          |
-|                           +---------------------+          |
-|                                                            |
-+------------------------------------------------------------+
+                           AgentTrace
+
+  Agent Code --> TracedAgent --> TraceCapture
+                                         |
+                                         v
+                                  ExecutionGraph
+                                (SSA + CFG + phi-nodes)
+                                         |
+                      +------------------+--------------+
+                      v                  v              v
+               SemanticResolver    AgentIR       SCM Engine
+              (语义格解析)      (why/what_if)   (因果推理)
+                      |                  |              |
+                      +------------------+--------------+
+                                         |
+                                         v
+                                  TraceDiffResult
+                            (根因 + 影响范围 + 修复建议)
+                                         |
+                                         v
+                            +---------------------+
+                            |    DevTools UI       |
+                            | (Vue 3 + ECharts)    |
+                            +---------------------+
 ```
 
 ### 核心引擎
