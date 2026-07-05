@@ -609,8 +609,13 @@ def _explain_step(sid: str, step_map: Dict[str, Dict]) -> CausalStep:
         produces = step.get("produces", {})
         cond_name = step.get("condition", step.get("name", "?"))
         desc = f"Decision `{cond_name}` = {value}"
-        if step.get("true_branch"):
-            desc += f" → took '{step['true_branch']}' path"
+        branch_label = None
+        if value is True:
+            branch_label = step.get("true_branch")
+        elif value is False:
+            branch_label = step.get("false_branch")
+        if branch_label:
+            desc += f" → took '{branch_label}' path"
         desc += conf_tag
 
     elif st == "TOOL":

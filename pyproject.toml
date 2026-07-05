@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttrace"
@@ -25,6 +25,22 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/agenttrace/agenttrace"
 Repository = "https://github.com/agenttrace/agenttrace"
+
+[project.scripts]
+agenttrace = "agent_obs.cli_main:main"
+
+[tool.setuptools]
+py-modules = ["demo"]
+
+[tool.setuptools.data-files]
+"agent-trace-ui" = ["agent-trace-ui/server.py"]
+"agent-trace-ui/dist" = [
+    "agent-trace-ui/dist/index.html",
+    "agent-trace-ui/dist/icons.svg",
+    "agent-trace-ui/dist/dev_trace.json",
+    "agent-trace-ui/dist/demo_trace.json",
+]
+"agent-trace-ui/dist/assets" = ["agent-trace-ui/dist/assets/*"]
 
 [tool.setuptools.packages.find]
 include = ["agent_obs*", "agenttrace*"]

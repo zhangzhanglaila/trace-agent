@@ -11,12 +11,57 @@ import os
 import json
 import argparse
 import importlib.util
+import shutil
 from pathlib import Path
 
 from .trace_core import TracedAgent, explain_diff
 from .trace_export import TraceExport
 from .trace_diff import TraceDiffer, render_diff, render_causal_verdict
 from .instrument.auto import auto_trace
+
+
+FRONTEND_PORT = 5173
+
+
+def _configure_console() -> None:
+    """Keep Windows/GBK consoles from crashing on unicode CLI output."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _npm_executable() -> str:
+    """Resolve npm on Windows where the executable is npm.cmd."""
+    return shutil.which("npm") or shutil.which("npm.cmd") or "npm"
+
+
+def _stop_process_tree(proc) -> None:
+    """Terminate a child process and its descendants."""
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        import subprocess
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        proc.terminate()
+
+
+def _find_ui_dir() -> str:
+    candidates = [
+        Path(__file__).parent.parent / "agent-trace-ui",
+        Path(sys.prefix) / "agent-trace-ui",
+        Path.cwd() / "agent-trace-ui",
+    ]
+    for candidate in candidates:
+        if (candidate / "server.py").exists():
+            return str(candidate)
+    return str(candidates[0])
 
 
 # ============================================================
@@ -313,6 +358,8 @@ def _enrich_causal_chain(diff_result, ctx_a, ctx_b):
 # ============================================================
 
 def main():
+    _configure_console()
+
     parser = argparse.ArgumentParser(
         prog="agenttrace",
         description="AgentTrace: Trace, Diff, and Debug agent executions.",
@@ -402,7 +449,7 @@ def cmd_dev(args):
 
     script_path, obj_path = _parse_script_ref(args.script)
     script_path = os.path.abspath(script_path)
-    ui_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent-trace-ui")
+    ui_dir = _find_ui_dir()
     dev_json_path = os.path.join(ui_dir, "public", "dev_trace.json")
 
     print()
@@ -501,22 +548,28 @@ def cmd_dev(args):
         try:
             if not os.path.exists(os.path.join(ui_dir, "node_modules")):
                 print("  Installing npm dependencies (first run)...")
-                subprocess.run(["npm", "install"], cwd=ui_dir, capture_output=True)
+                subprocess.run([_npm_executable(), "install"], cwd=ui_dir, capture_output=True)
 
             frontend_proc = subprocess.Popen(
-                ["npm", "run", "dev"],
+                [_npm_executable(), "run", "dev"],
                 cwd=ui_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
             time.sleep(3)
-            print(f"  Frontend: http://localhost:5173")
+            print(f"  Frontend: http://localhost:{FRONTEND_PORT}")
         except Exception as e:
             print(f"  [WARN] Frontend failed: {e}")
             frontend_proc = None
     else:
-        print("  [WARN] Node.js not found. Open agent-trace-ui/dist/index.html manually.")
+        print("  [WARN] Node.js not found. Using backend static server.")
         frontend_proc = None
+
+    ui_url = (
+        f"http://localhost:{FRONTEND_PORT}"
+        if frontend_proc is not None
+        else f"http://127.0.0.1:{port}"
+    )
 
     # ── Step 4: Open browser ──
     print(f"\n" + "=" * 55)
@@ -525,26 +578,24 @@ def cmd_dev(args):
 
     if not args.no_browser:
         time.sleep(1)
-        webbrowser.open("http://localhost:5173")
-        print(f"  Browser opened.")
+        webbrowser.open(ui_url)
+        print(f"  Browser opened: {ui_url}")
 
     print()
     print("  ╔" + "═" * 53 + "╗")
     print("  ║  [OK] AgentTrace Dev is live!                        ║")
     print("  ║                                                   ║")
-    print("  ║  UI:  http://localhost:5173                        ║")
+    print(f"  ║  UI:  {ui_url:<43} ║")
     print(f"  ║  API: http://127.0.0.1:{port}/api/trace/dev        ║")
     print("  ║                                                   ║")
     print("  ║  Press Ctrl+C to stop all services                ║")
-    print("  ╚" + "═" + 53 + "╝")
+    print("  ╚" + "═" * 53 + "╝")
     print()
 
     def shutdown(sig, frame):
         print("\n  Shutting down...")
-        if frontend_proc:
-            frontend_proc.terminate()
-        if backend_proc:
-            backend_proc.terminate()
+        _stop_process_tree(frontend_proc)
+        _stop_process_tree(backend_proc)
         print("  Done.")
         sys.exit(0)
 

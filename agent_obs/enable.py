@@ -222,9 +222,10 @@ def _find_ui_dir() -> Optional[Path]:
     candidates = [
         Path(__file__).parent.parent / "agent-trace-ui",
         Path.cwd() / "agent-trace-ui",
+        Path(sys.prefix) / "agent-trace-ui",
     ]
     for d in candidates:
-        if d.exists():
+        if (d / "server.py").exists():
             return d
     return None
 

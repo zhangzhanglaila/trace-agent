@@ -24,9 +24,60 @@ import subprocess
 import argparse
 import webbrowser
 from pathlib import Path
+import shutil
+from typing import Optional
 
 ROOT = Path(__file__).parent
-UI_DIR = ROOT / "agent-trace-ui"
+FRONTEND_PORT = 5173
+
+
+def find_ui_dir() -> Path:
+    candidates = [
+        ROOT / "agent-trace-ui",
+        Path(sys.prefix) / "agent-trace-ui",
+    ]
+    for candidate in candidates:
+        if (candidate / "server.py").exists():
+            return candidate
+    return candidates[0]
+
+
+UI_DIR = find_ui_dir()
+
+
+def configure_console() -> None:
+    """Keep Windows/GBK consoles from crashing on unicode demo output."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def npm_executable() -> str:
+    """Resolve npm on Windows where the executable is npm.cmd."""
+    return shutil.which("npm") or shutil.which("npm.cmd") or "npm"
+
+
+def frontend_url(frontend_proc: Optional[subprocess.Popen], port: int) -> str:
+    """Return a usable UI URL, falling back to backend static serving."""
+    if frontend_proc is not None:
+        return f"http://localhost:{FRONTEND_PORT}"
+    return f"http://127.0.0.1:{port}"
+
+
+def stop_process_tree(proc: Optional[subprocess.Popen]) -> None:
+    """Terminate a child process and its descendants."""
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        proc.terminate()
 
 
 def generate_trace(bug_enabled: bool = True) -> bool:
@@ -143,10 +194,10 @@ def start_frontend() -> subprocess.Popen:
 
     if not check_npm_installed():
         print("  Installing npm dependencies (first run)...")
-        subprocess.run(["npm", "install"], cwd=str(UI_DIR), capture_output=True)
+        subprocess.run([npm_executable(), "install"], cwd=str(UI_DIR), capture_output=True)
 
     proc = subprocess.Popen(
-        ["npm", "run", "dev"],
+        [npm_executable(), "run", "dev"],
         cwd=str(UI_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -156,15 +207,17 @@ def start_frontend() -> subprocess.Popen:
     return proc
 
 
-def open_browser():
+def open_browser(url: str):
     """Open the DevTools UI in the default browser."""
     print(f"\n  Step 4/4: Opening browser...")
     time.sleep(1)
-    webbrowser.open("http://localhost:5173")
-    print(f"  Browser opened.")
+    webbrowser.open(url)
+    print(f"  Browser opened: {url}")
 
 
 def main():
+    configure_console()
+
     parser = argparse.ArgumentParser(
         description="AgentTrace — One-Click Demo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -219,30 +272,29 @@ Examples:
         frontend_proc = None
 
     # 4. Open browser
+    ui_url = frontend_url(frontend_proc, args.port)
     if not args.no_browser:
         try:
-            open_browser()
+            open_browser(ui_url)
         except Exception:
-            print("  Could not open browser. Open http://localhost:5173 manually.")
+            print(f"  Could not open browser. Open {ui_url} manually.")
 
     print()
     print("  ╔" + "═" * 53 + "╗")
     print("  ║  ✅ AgentTrace DevTools is running!              ║")
     print("  ║                                                   ║")
-    print("  ║  UI:  http://localhost:5173                        ║")
+    print(f"  ║  UI:  {ui_url:<43} ║")
     print(f"  ║  API: http://127.0.0.1:{args.port}/api/trace/demo  ║")
     print("  ║                                                   ║")
     print("  ║  Press Ctrl+C to stop all services                ║")
-    print("  ╚" + "═" + 53 + "╝")
+    print("  ╚" + "═" * 53 + "╝")
     print()
 
     # Wait for Ctrl+C
     def shutdown(sig, frame):
         print("\n  Shutting down...")
-        if frontend_proc:
-            frontend_proc.terminate()
-        if backend_proc:
-            backend_proc.terminate()
+        stop_process_tree(frontend_proc)
+        stop_process_tree(backend_proc)
         print("  Done.")
         sys.exit(0)
 
