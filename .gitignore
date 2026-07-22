@@ -9,3 +9,7 @@ venv/
 !.env.example
 *.key
 secrets*.json
+
+# 单次运行视图的生成产物
+single_run_*.html
+single_run_report.json

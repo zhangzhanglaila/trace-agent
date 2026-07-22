@@ -20,6 +20,7 @@ from agent_obs.instrument.auto import auto_trace
 from agent_obs.trace_core import trace_root, trace_span, SEM
 from agent_obs.single_run import build_single_run_report
 from agent_obs.health import analyze_health
+from agent_obs.single_run_view import write_html
 
 
 # ── 用户的 Agent（对 AgentTrace 无感知） ──
@@ -118,7 +119,14 @@ def print_report(report: dict):
 
 if __name__ == "__main__":
     print(">> 场景 1：正常运行（应得健康报告）")
-    print_report(run_once("ok", "东京今天天气怎么样？", fail_tool=False))
+    r_ok = run_once("ok", "东京今天天气怎么样？", fail_tool=False)
+    print_report(r_ok)
 
     print("\n\n>> 场景 2：工具抛错（应自动定位失败步骤）")
-    print_report(run_once("fail", "东京今天天气怎么样？", fail_tool=True))
+    r_fail = run_once("fail", "东京今天天气怎么样？", fail_tool=True)
+    print_report(r_fail)
+
+    # 生成可离线打开的 HTML 视图（M1.4）
+    write_html(r_ok, "single_run_ok.html")
+    write_html(r_fail, "single_run_fail.html")
+    print("\n\n>> 已生成 HTML 视图：single_run_ok.html / single_run_fail.html（浏览器打开即可查看）")
