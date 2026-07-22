@@ -145,6 +145,16 @@ class TraceContext:
 
         for step in self.capture.steps:
             if step.get("id") == step_id:
+                # 重算 span 真实耗时：start_span 记录时 start==end(latency≈0)，
+                # 这里到 end_span 才是 span 的真实结束时刻。用记录时的 start_time
+                # （优先 capture._start_times）重算 end_time / latency_ms，
+                # 让慢步骤检测在真实跨度步骤上生效（M1.2.1）。
+                start_ts = self.capture._start_times.get(step_id, step.get("start_time"))
+                if isinstance(start_ts, (int, float)):
+                    end_ts = time.time()
+                    step["start_time"] = start_ts
+                    step["end_time"] = end_ts
+                    step["latency_ms"] = (end_ts - start_ts) * 1000
                 if outputs:
                     step["outputs"] = outputs
                     if step.get("type") == "tool" and "result" in outputs:

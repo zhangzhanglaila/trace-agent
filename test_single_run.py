@@ -105,6 +105,20 @@ def test_duration_falls_back_to_latency_sum():
     assert r["started_at"] is None
 
 
+def test_span_latency_recomputed_on_end():
+    """M1.2.1：end_span 应重算真实 span 耗时（不再是 ~0）。"""
+    import time
+    ctx = TraceContext(run_name="timing")
+    sid = ctx.start_span("work", inputs={})
+    time.sleep(0.02)
+    ctx.end_span(sid, outputs={"result": "done"})
+    step = next(s for s in ctx.capture.steps if s.get("id") == sid)
+    assert step["latency_ms"] >= 15  # 真实约 20ms，留调度余量
+    r = build_single_run_report(ctx)
+    work = next(s for s in r["steps"] if s["id"] == sid)
+    assert work["duration_ms"] >= 15
+
+
 def test_accepts_trace_context_source():
     """端到端：真实 TraceContext → 报告。"""
     ctx = TraceContext(run_name="ctx_run")
