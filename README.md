@@ -49,20 +49,74 @@ A/B 对比 → 因果 Diff → 根因定位 → 人话解释 + 修复建议
 pip install agenttrace
 ```
 
+### 场景 1：你的 Agent 是一个函数
+
 ```python
-from agenttrace import trace_run, observe
+from agenttrace import observe
 
-@observe  # 可选：装饰器换取更精确的步骤边界
+@observe  # 只需一行装饰器
 def my_agent(question: str) -> str:
-    # 你的 Agent 代码
-    return answer
+    # 你的 Agent 逻辑
+    result = llm.invoke(question)
+    return result
 
-# 运行一次，自动生成报告（即使抛异常也会生成）
-result = trace_run(my_agent, "帮我规划东京之旅")
+# 正常调用，自动生成报告
+answer = my_agent("帮我规划东京之旅")
 # 报告路径：./reports/<timestamp>_trace.html
 ```
 
+### 场景 2：你的 Agent 是 LangGraph/LangChain
+
+```python
+from langgraph.graph import StateGraph
+from agenttrace import trace_run
+
+# 你的 Agent 定义（完全不用改）
+def build_agent():
+    g = StateGraph(State)
+    g.add_node("classify", classify_node)
+    g.add_node("search", search_node)
+    return g.compile()
+
+agent = build_agent()
+
+# 用 trace_run 包住调用即可
+with trace_run("my_agent", html_path="run.html") as run:
+    result = agent.invoke({"query": "帮我规划东京之旅"})
+
+print(run.status)   # "success" / "failed" / "stuck"
+print(run.summary)  # 人话诊断
+```
+
+### 场景 3：Agent 跑到一半卡住了？
+
+**这是 AgentTrace 解决的核心问题**：当 Agent 卡住时，你能立刻看到它卡在哪一步。
+
+```python
+with trace_run("my_agent", stuck_timeout=30.0) as run:
+    result = agent.invoke({"query": "..."})
+
+# 如果 30 秒没有新步骤触发，会收到告警：
+# "运行疑似卡住：已 30 秒未触发新步骤"
+# HTML 报告会用橙色标记最后执行到的步骤（卡点）
+```
+
+### 场景 4：Agent 抛异常了？
+
+即使 Agent 抛异常，报告依然会生成，并自动标红失败步骤：
+
+```python
+with trace_run("my_agent") as run:
+    result = agent.invoke({"query": "..."})  # 假设这里抛了异常
+# 异常仍会正常抛出，不影响你的错误处理
+# 但 run.report 已经包含了失败定位信息
+```
+
+### 真实输出示例
+
 运行后自动生成 HTML 报告，不到 30 秒你会看到：
+
+**✅ 正常运行示例：**
 
 > **🟢 运行成功**（4 步，2255ms）
 >
@@ -75,9 +129,23 @@ result = trace_run(my_agent, "帮我规划东京之旅")
 > **🔍 健康状态**
 > - 失败步骤：无
 > - 卡点：无
-> - 慢步骤：无（所有步骤在正常范围内）
+> - 慢步骤：无
 
-不需要配置、不需要 API Key、不需要改别人 Agent 代码。
+**❌ 工具失败示例：**
+
+> **🔴 运行失败**（3 步，1250ms）
+>
+> **📖 步骤时间线**
+> - ✅ LLM: classify_intent (861ms)
+> - ❌ Tool: weather_api (389ms) **← 失败点**
+>   ```
+>   RuntimeError: 天气服务连接超时
+>   ```
+> - ⏸️ LLM: summarize (未执行)
+>
+> **🔍 健康状态**
+> - 失败步骤：`weather_api`（工具抛异常）
+> - 修复建议：检查天气服务可用性或增加重试逻辑
 
 ---
 
@@ -117,44 +185,6 @@ Agent 正在跑时，像进度条一样实时看到走到哪一步：
 | **根因定位** | 精确定位分叉点和根因变量 |
 | **错误分类** | 基于结构化特征分类（超时 / Schema 不匹配 / 重试循环等） |
 | **修复建议** | 模板化建议生成 |
-
----
-
-## 使用方式
-
-### 方式一：上下文管理器（推荐）
-
-```python
-from agenttrace import trace_run, observe
-
-@observe
-def my_agent(question: str) -> str:
-    # 你的 Agent 代码
-    return answer
-
-result = trace_run(my_agent, "帮我规划东京之旅")
-```
-
-### 方式二：LangChain 无缝接入
-
-```python
-from agenttrace.adapters.langchain import enable
-enable()
-
-# 你的 LangGraph / LangChain Agent
-result = agent.invoke("帮我规划东京之旅")
-# 自动生成报告
-```
-
-### 方式三：CLI 命令行
-
-```bash
-# 运行并生成单次报告
-python -m agent_obs.cli_main run my_agent.py -i "帮我规划东京之旅"
-
-# A/B 对比
-python -m agent_obs.cli_main diff run_a.json run_b.json
-```
 
 ---
 
@@ -318,20 +348,74 @@ A/B Comparison → Causal Diff → Root Cause → Human Explanation + Fix Sugges
 pip install agenttrace
 ```
 
+### Scenario 1: Your agent is a function
+
 ```python
-from agenttrace import trace_run, observe
+from agenttrace import observe
 
-@observe  # Optional: decorator for more precise step boundaries
+@observe  # Only one decorator needed
 def my_agent(question: str) -> str:
-    # Your agent code
-    return answer
+    # Your agent logic
+    result = llm.invoke(question)
+    return result
 
-# Run once, auto-generate report (even if exception is raised)
-result = trace_run(my_agent, "Help me plan a trip to Tokyo")
+# Normal call, auto-generates report
+answer = my_agent("Help me plan a trip to Tokyo")
 # Report path: ./reports/<timestamp>_trace.html
 ```
 
+### Scenario 2: Your agent is LangGraph/LangChain
+
+```python
+from langgraph.graph import StateGraph
+from agenttrace import trace_run
+
+# Your agent definition (no changes needed)
+def build_agent():
+    g = StateGraph(State)
+    g.add_node("classify", classify_node)
+    g.add_node("search", search_node)
+    return g.compile()
+
+agent = build_agent()
+
+# Wrap the call with trace_run
+with trace_run("my_agent", html_path="run.html") as run:
+    result = agent.invoke({"query": "Help me plan a trip to Tokyo"})
+
+print(run.status)   # "success" / "failed" / "stuck"
+print(run.summary)  # Human-readable diagnosis
+```
+
+### Scenario 3: Agent stuck halfway?
+
+**This is the core problem AgentTrace solves**: When the agent gets stuck, you can immediately see which step it's stuck on.
+
+```python
+with trace_run("my_agent", stuck_timeout=30.0) as run:
+    result = agent.invoke({"query": "..."})
+
+# If no new step triggers within 30 seconds, you get an alert:
+# "Run appears stuck: 30 seconds without new steps"
+# HTML report marks the last executed step in orange (stuck point)
+```
+
+### Scenario 4: Agent throws exception?
+
+Even if the agent throws an exception, a report is still generated and automatically marks the failed step in red:
+
+```python
+with trace_run("my_agent") as run:
+    result = agent.invoke({"query": "..."})  # Assume exception here
+# Exception still throws normally, doesn't affect your error handling
+# But run.report already contains failure location info
+```
+
+### Real Output Example
+
 After running, an HTML report is automatically generated. Within 30 seconds you'll see:
+
+**✅ Normal Run Example:**
 
 > **🟢 Run Success** (4 steps, 2255ms)
 >
@@ -344,9 +428,23 @@ After running, an HTML report is automatically generated. Within 30 seconds you'
 > **🔍 Health Status**
 > - Failed steps: None
 > - Stuck point: None
-> - Slow steps: None (all steps within normal range)
+> - Slow steps: None
 
-No configuration, no API key, no need to modify others' agent code.
+**❌ Tool Failure Example:**
+
+> **🔴 Run Failed** (3 steps, 1250ms)
+>
+> **📖 Step Timeline**
+> - ✅ LLM: classify_intent (861ms)
+> - ❌ Tool: weather_api (389ms) **← Failure Point**
+>   ```
+>   RuntimeError: Weather service connection timeout
+>   ```
+> - ⏸️ LLM: summarize (not executed)
+>
+> **🔍 Health Status**
+> - Failed step: `weather_api` (tool threw exception)
+> - Fix suggestion: Check weather service availability or add retry logic
 
 ---
 
@@ -386,44 +484,6 @@ Same agent, same prompt, fails with different inputs — why?
 | **Root Cause Location** | Precisely locate divergence point and root cause variable |
 | **Error Classification** | Structured feature-based classification (timeout / schema mismatch / retry loop, etc.) |
 | **Fix Suggestions** | Template-based suggestion generation |
-
----
-
-## Usage
-
-### Method 1: Context Manager (Recommended)
-
-```python
-from agenttrace import trace_run, observe
-
-@observe
-def my_agent(question: str) -> str:
-    # Your agent code
-    return answer
-
-result = trace_run(my_agent, "Help me plan a trip to Tokyo")
-```
-
-### Method 2: LangChain Seamless Integration
-
-```python
-from agenttrace.adapters.langchain import enable
-enable()
-
-# Your LangGraph / LangChain agent
-result = agent.invoke("Help me plan a trip to Tokyo")
-# Auto-generate report
-```
-
-### Method 3: CLI
-
-```bash
-# Run and generate single report
-python -m agent_obs.cli_main run my_agent.py -i "Help me plan a trip to Tokyo"
-
-# A/B comparison
-python -m agent_obs.cli_main diff run_a.json run_b.json
-```
 
 ---
 
