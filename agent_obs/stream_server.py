@@ -60,6 +60,20 @@ def push_step_event(step: dict):
     _STREAM_EVENT.set()
 
 
+def push_alert_event(alert_type: str, message: str, step_id: str = None):
+    """推送告警事件（卡住/超时）到所有订阅的客户端。
+
+    M2.3 实时告警：超过阈值未触发新步时推送。
+
+    Args:
+        alert_type: 告警类型，如 "stuck" / "timeout"。
+        message: 人话描述。
+        step_id: 卡住所在的步骤 ID（可选）。
+    """
+    _STREAM_QUEUE.put({"alert": alert_type, "message": message, "step_id": step_id})
+    _STREAM_EVENT.set()
+
+
 def start_server(port: int = 8766, background: bool = False):
     """启动 SSE 推送服务器。
 

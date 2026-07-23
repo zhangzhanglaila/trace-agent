@@ -23,6 +23,8 @@
 更准确的步骤命名与输入输出。
 """
 
+import time
+import threading
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, Dict, Optional
@@ -32,6 +34,47 @@ from .instrument.auto import auto_trace
 from .single_run import build_single_run_report
 from .health import analyze_health, HealthConfig
 from .single_run_view import write_html
+
+
+class _TimeoutWatcher:
+    """M2.3 卡住告警：后台线程监控超时未触发新步。"""
+
+    def __init__(self, timeout: float, on_alert: Callable[[float], None]):
+        self.timeout = timeout
+        self.on_alert = on_alert
+        self.last_step_time: Optional[float] = None
+        self._start_time: Optional[float] = None  # 记录 watcher 启动时间
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def touch(self):
+        """记录有新步发生（重置计时）。"""
+        self.last_step_time = time.time()
+
+    def start(self):
+        """启动后台监控线程。"""
+        self._start_time = time.time()  # 记录启动时刻
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def _watch(self):
+        """后台线程：每秒检查一次是否超时。"""
+        while not self._stop.is_set():
+            current = time.time()
+            # 优先用 last_step_time（最后一步时刻），否则用 start_time
+            reference = self.last_step_time or self._start_time
+            if reference:
+                elapsed = current - reference
+                if elapsed > self.timeout:
+                    self.on_alert(elapsed)
+                    self.last_step_time = None  # 防止重复告警
+            self._stop.wait(1)  # 每秒检查一次
+
+    def stop(self):
+        """停止监控线程。"""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
 
 
 class RunHandle:
@@ -58,6 +101,7 @@ def trace_run(
     config: Optional[HealthConfig] = None,
     patch: bool = True,
     on_step: Optional[Callable] = None,
+    stuck_timeout: float = 30.0,
 ):
     """包住一次运行，退出时自动产出 SingleRunReport（并可写 HTML）。
 
@@ -67,6 +111,7 @@ def trace_run(
         config: 健康分析阈值（慢步骤等），缺省用默认。
         patch: 是否自动 patch LangChain/OpenAI（默认开，保证 LLM 步被捕获）。
         on_step: 每步结束时回调（M2.1 实时监控），收到原始步骤 dict。
+        stuck_timeout: 卡住告警阈值（秒），超时未触发新步则推送告警（M2.3）。
 
     Yields:
         RunHandle —— 退出 with 块后 `.report`/`.status`/`.summary` 可用。
@@ -74,15 +119,40 @@ def trace_run(
     if patch:
         auto_trace()  # 幂等
     handle = RunHandle(name)
-    holder: Dict[str, Any] = {"ctx": None, "completed": True}
+    holder: Dict[str, Any] = {"ctx": None, "completed": True, "last_step_id": None}
+
+    # M2.3 卡住告警 watcher
+    def on_alert(elapsed):
+        # 获取最后执行的步骤 ID 用于告警
+        last_id = holder.get("last_step_id")
+        from .stream_server import push_alert_event
+        msg = f"运行疑似卡住：已 {elapsed:.0f} 秒未触发新步骤"
+        push_alert_event("stuck", msg, step_id=last_id)
+
+    watcher = _TimeoutWatcher(stuck_timeout, on_alert) if stuck_timeout > 0 else None
+
+    def wrapped_on_step(step):
+        # 更新最后步骤 ID
+        holder["last_step_id"] = step.get("id")
+        if watcher:
+            watcher.touch()
+        if on_step:
+            on_step(step)
+
     try:
-        with trace_root(name, auto_export=False, on_step_end=on_step) as ctx:
+        if watcher:
+            watcher.start()
+        with trace_root(name, auto_export=False, on_step_end=wrapped_on_step) as ctx:
             holder["ctx"] = ctx
+            if watcher:
+                watcher.touch()  # 开始运行时也要 touch 一下
             yield handle
     except BaseException:
         holder["completed"] = False
         raise
     finally:
+        if watcher:
+            watcher.stop()
         ctx = holder["ctx"]
         if ctx is not None:
             report = build_single_run_report(ctx, run_name=name)
