@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentTrace · 实时监控演示</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+         background:#f5f7fa; color:#303133; padding:32px; }
+  .wrap { max-width:600px; margin:0 auto; }
+  h1 { font-size:20px; margin-bottom:16px; }
+  .status { font-size:13px; color:#909399; margin-bottom:20px; }
+  .status.connected { color:#67c23a; }
+  .step { background:#fff; border:1px solid #ebeef5; border-left:4px solid #dcdfe6;
+          border-radius:6px; padding:12px 16px; margin-bottom:10px; animation:slide .2s; }
+  @keyframes slide { from { opacity:0; transform:translateX(-10px); } to { opacity:1; transform:translateX(0); } }
+  .row { display:flex; align-items:center; gap:10px; }
+  .icon { width:20px; text-align:center; font-weight:700; color:#67c23a; }
+  .kind { font-size:11px; padding:2px 8px; border-radius:4px; background:#f0f2f5; color:#606266;
+          text-transform:uppercase; letter-spacing:.5px; }
+  .name { flex:1; font-weight:600; font-size:14px; }
+  .dur { color:#909399; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AgentTrace · 实时监控演示</h1>
+  <div id="status" class="status">连接中...</div>
+  <div id="steps"></div>
+</div>
+<script>
+const status = document.getElementById('status');
+const box = document.getElementById('steps');
+const es = new EventSource('http://127.0.0.1:8766/stream');
+
+es.onopen = () => {
+  status.textContent = '已连接 · 等待步骤事件...';
+  status.className = 'status connected';
+};
+
+es.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+  if (data === 'connected') return;
+
+  const kind = data.semantic_type || data.type || '?';
+  const name = data.semantic_name || data.name || data.id || '?';
+  const dur = data.latency_ms ? (data.latency_ms >= 1000 ? (data.latency_ms/1000).toFixed(2)+'s' : data.latency_ms.toFixed(0)+'ms') : '-';
+
+  const el = document.createElement('div');
+  el.className = 'step';
+  el.innerHTML = `
+    <div class="row">
+      <span class="icon">✓</span>
+      <span class="kind">${esc(kind)}</span>
+      <span class="name">${esc(name)}</span>
+      <span class="dur">${dur}</span>
+    </div>`;
+  box.appendChild(el);
+
+  status.textContent = `已连接 · 已捕获 ${box.children.length} 步`;
+};
+
+es.onerror = () => {
+  status.textContent = '连接断开';
+  status.className = 'status';
+};
+
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+</script>
+</body>
+</html>
