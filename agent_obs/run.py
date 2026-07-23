@@ -57,6 +57,7 @@ def trace_run(
     html_path: Optional[str] = None,
     config: Optional[HealthConfig] = None,
     patch: bool = True,
+    on_step: Optional[Callable] = None,
 ):
     """包住一次运行，退出时自动产出 SingleRunReport（并可写 HTML）。
 
@@ -65,6 +66,7 @@ def trace_run(
         html_path: 若给定，退出时把报告渲染成自包含 HTML 写到此路径。
         config: 健康分析阈值（慢步骤等），缺省用默认。
         patch: 是否自动 patch LangChain/OpenAI（默认开，保证 LLM 步被捕获）。
+        on_step: 每步结束时回调（M2.1 实时监控），收到原始步骤 dict。
 
     Yields:
         RunHandle —— 退出 with 块后 `.report`/`.status`/`.summary` 可用。
@@ -74,7 +76,7 @@ def trace_run(
     handle = RunHandle(name)
     holder: Dict[str, Any] = {"ctx": None, "completed": True}
     try:
-        with trace_root(name, auto_export=False) as ctx:
+        with trace_root(name, auto_export=False, on_step_end=on_step) as ctx:
             holder["ctx"] = ctx
             yield handle
     except BaseException:

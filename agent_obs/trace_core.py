@@ -70,7 +70,8 @@ class TraceContext:
     - consumes: dict of key → value this node depends on
     """
 
-    def __init__(self, run_name: str = "agent_run", out_dir: str = None):
+    def __init__(self, run_name: str = "agent_run", out_dir: str = None,
+                 on_step_end: Optional[Callable] = None):
         self.run_name = run_name
         self.out_dir = out_dir or "."
         self.capture = TraceCapture()
@@ -79,6 +80,7 @@ class TraceContext:
         self._span_count = 0
         self._export_path: Optional[str] = None
         self._result: Any = None
+        self.on_step_end = on_step_end  # M2.1 实时回调：每步结束时调用，传入步骤数据
 
     # ── Span management ──
 
@@ -176,6 +178,9 @@ class TraceContext:
                         "evidence": semantic_signal.evidence,
                     }
                 break
+        # M2.1 实时回调：把刚结束的步骤数据立即推给订阅者
+        if self.on_step_end and step:
+            self.on_step_end(step)
 
     def record_decision(self, name: str, value: Any,
                         consumes: Dict = None,
@@ -960,7 +965,7 @@ def _find_last_meaningful(ctx) -> Optional[str]:
 
 @contextmanager
 def trace_root(run_name: str = "agent_run", out_dir: str = None,
-               auto_export: bool = True):
+               auto_export: bool = True, on_step_end: Optional[Callable] = None):
     """
     Create a root trace context. Auto-exports trace.json on exit.
 
@@ -968,8 +973,13 @@ def trace_root(run_name: str = "agent_run", out_dir: str = None,
         with trace_root("my_agent") as ctx:
             ...
         # trace_my_agent_xxx.json written here
+
+    M2.1 实时监控：
+        with trace_root("my", on_step_end=lambda step: print(step['name'])) as ctx:
+            ...
+        # 每步结束时立即回调，传入步骤数据
     """
-    ctx = TraceContext(run_name, out_dir)
+    ctx = TraceContext(run_name, out_dir, on_step_end=on_step_end)
     _local.trace_ctx = ctx
 
     try:

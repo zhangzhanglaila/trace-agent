@@ -14,3 +14,5 @@ secrets*.json
 single_run_*.html
 single_run_report.json
 single_run_oneliner.html
+# 运行测试时遗留的 trace JSON
+trace_*.json
