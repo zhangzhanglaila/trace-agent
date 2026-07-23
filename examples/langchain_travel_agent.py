@@ -402,10 +402,11 @@ def run_demo(bug_enabled: bool = True, cli_only: bool = False):
     print()
 
     # ── Diff ──
-    differ = TraceDiffer(export_a, export_b)
+    differ = TraceDiffer(export_a, export_b,
+                        context_a=traced_a.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative is now auto-populated by TraceDiffer
 
     print(render_causal_verdict(diff_result))
 

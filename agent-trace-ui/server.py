@@ -72,10 +72,11 @@ def build_trace(bug_enabled: bool = True) -> str:
     export_b = TraceExport.from_file(traced_b.last_trace_path)
 
     # Diff
-    differ = TraceDiffer(export_a, export_b)
+    differ = TraceDiffer(export_a, export_b,
+                        context_a=traced_a.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative is now auto-populated by TraceDiffer
 
     result = adapt_diff_result(diff_result, export_a, export_b)
     result["meta"]["bug_enabled"] = bug_enabled
@@ -140,10 +141,11 @@ def build_trace_custom(bug_enabled: bool = True, input_a: str = "", input_b: str
     traced_b.run(input_b)
     export_b = TraceExport.from_file(traced_b.last_trace_path)
 
-    differ = TraceDiffer(export_a, export_b)
+    differ = TraceDiffer(export_a, export_b,
+                        context_a=traced_a.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative is now auto-populated by TraceDiffer
 
     result = adapt_diff_result(diff_result, export_a, export_b)
     result["meta"]["bug_enabled"] = bug_enabled
@@ -183,10 +185,11 @@ def build_what_if() -> str:
     traced_c.run("Plan a trip to Mars for hiking")
     export_c = TraceExport.from_file(traced_c.last_trace_path)
 
-    differ_ab = TraceDiffer(export_a, export_b)
+    differ_ab = TraceDiffer(export_a, export_b,
+                           context_a=traced_a.last_ctx,
+                           context_b=traced_b.last_ctx)
     diff_ab = differ_ab.diff()
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_ab.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative is now auto-populated by TraceDiffer
 
     result_ab = adapt_diff_result(diff_ab, export_a, export_b)
 

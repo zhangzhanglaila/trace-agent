@@ -16,3 +16,6 @@ single_run_report.json
 single_run_oneliner.html
 # 运行测试时遗留的 trace JSON
 trace_*.json
+
+# Claude 本地设置（可能包含 API Key）
+.claude/settings.local.json

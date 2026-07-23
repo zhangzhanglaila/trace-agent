@@ -115,10 +115,11 @@ def generate_trace(bug_enabled: bool = True) -> bool:
     # Diff
     export_a = TraceExport.from_file(traced_a.last_trace_path)
     export_b = TraceExport.from_file(traced_b.last_trace_path)
-    differ = TraceDiffer(export_a, export_b)
+    differ = TraceDiffer(export_a, export_b,
+                        context_a=traced_a.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative is now auto-populated by TraceDiffer
 
     # Adapt to frontend JSON
     ui_json = adapt_diff_result(diff_result, export_a, export_b)

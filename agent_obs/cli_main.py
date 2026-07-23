@@ -289,14 +289,13 @@ def cmd_debug(args):
     # Diff with causal enrichment
     trace_a = TraceExport.from_file(trace_a_path)
     trace_b = TraceExport.from_file(trace_b_path)
-    differ = TraceDiffer(trace_a, trace_b)
+    differ = TraceDiffer(trace_a, trace_b,
+                        context_a=traced.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
 
-    # Enrich with causal explanation from TraceContext
-    if traced.last_ctx and traced_b.last_ctx:
-        causal_narrative = explain_diff(traced.last_ctx, traced_b.last_ctx)
-        diff_result.causal_narrative = causal_narrative
-        _enrich_causal_chain(diff_result, traced.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative and causal_chain are now auto-populated by TraceDiffer
+    # if contexts were provided
 
     # Render the causal verdict (interview-ready format)
     print(render_causal_verdict(diff_result))
@@ -491,12 +490,13 @@ def cmd_dev(args):
 
     export_a = TraceExport.from_file(trace_a_path)
     export_b = TraceExport.from_file(trace_b_path)
-    differ = TraceDiffer(export_a, export_b)
+    differ = TraceDiffer(export_a, export_b,
+                        context_a=traced_a.last_ctx,
+                        context_b=traced_b.last_ctx)
     diff_result = differ.diff()
 
-    if traced_a.last_ctx and traced_b.last_ctx:
-        diff_result.causal_narrative = explain_diff(traced_a.last_ctx, traced_b.last_ctx)
-        _enrich_causal_chain(diff_result, traced_a.last_ctx, traced_b.last_ctx)
+    # Note: causal_narrative and causal_chain are now auto-populated by TraceDiffer
+    # if contexts were provided
 
     ui_json = adapt_diff_result(diff_result, export_a, export_b)
 

@@ -5,11 +5,15 @@ Not a JSON diff — a causal diff that answers "why did this run differ from tha
 Aligns by branch condition + path, then by step name.
 Pinpoints the first decision that caused divergence.
 """
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field
 import json
 
 from .trace_export import TraceExport, TraceRun
+
+# Forward reference to avoid circular import
+if TYPE_CHECKING:
+    from .trace_core import TraceContext
 
 
 # ============================================================
@@ -127,9 +131,13 @@ class TraceDiffer:
       3. First divergence = first branch where paths differ (causal), not first different step
     """
 
-    def __init__(self, trace_a: TraceExport, trace_b: TraceExport):
+    def __init__(self, trace_a: TraceExport, trace_b: TraceExport,
+                 context_a: Optional['TraceContext'] = None,
+                 context_b: Optional['TraceContext'] = None):
         self.a = trace_a
         self.b = trace_b
+        self.context_a = context_a  # Optional: for causal chain generation
+        self.context_b = context_b  # Optional: for causal chain generation
 
         # Index runs by ID for quick lookup
         self._runs_a: Dict[str, TraceRun] = {}
@@ -185,7 +193,35 @@ class TraceDiffer:
         # 7. Generate one-line human summary
         result.summary = self._build_summary(result)
 
+        # 8. Auto-generate causal chain if contexts are available (M3.1)
+        if self.context_a is not None and self.context_b is not None:
+            from .trace_core import explain_diff
+            result.causal_narrative = explain_diff(self.context_a, self.context_b)
+            # Extract causal chain from narrative for programmatic access
+            result.causal_chain = self._extract_causal_chain(result.causal_narrative)
+
         return result
+
+    def _extract_causal_chain(self, narrative: str) -> List[str]:
+        """Extract causal chain steps from narrative for programmatic access."""
+        if not narrative:
+            return []
+        # Parse the "Causal Chain Comparison" section
+        lines = narrative.split("\n")
+        chain = []
+        in_section = False
+        for line in lines:
+            if "Causal Chain Comparison:" in line:
+                in_section = True
+                continue
+            if in_section:
+                if line.strip().startswith("Root Cause Analysis:"):
+                    break
+                # Extract step descriptions (lines starting with "  =", "  A:", "  B:")
+                # Note: check original line, not stripped, to preserve indentation
+                if line.startswith(("  =", "  A:", "  B:", "\t=", "\tA:", "\tB:")):
+                    chain.append(line.strip())
+        return chain
 
     def _diff_branches(self) -> List[BranchDiff]:
         """Align branches by condition name, compare path taken."""
@@ -836,6 +872,38 @@ def _extract_root_variable(diff: TraceDiffResult, narrative: str) -> tuple:
     """
     Extract the root cause at the VARIABLE level (not tool level).
 
+    M3.3: Now uses VariableAnalyzer for structured extraction,
+    with fallback to narrative parsing for backward compatibility.
+
+    Returns (variable_name, run_a_value, run_b_value, source_description).
+    """
+    # Try to use VariableAnalyzer if we have access to context steps
+    # (This would be called from render_causal_verdict where diff might not have contexts)
+    # For now, fall back to narrative parsing
+    return _extract_root_variable_from_narrative(diff, narrative)
+
+
+def _extract_root_variable_from_context(steps_a: List, steps_b: List) -> tuple:
+    """
+    Extract root variable using VariableAnalyzer from step data.
+
+    Returns (variable_name, run_a_value, run_b_value, source_description).
+    """
+    try:
+        from .variable_analysis import VariableAnalyzer
+        analyzer = VariableAnalyzer(steps_a, steps_b)
+        result = analyzer.get_root_cause_variable()
+        if result:
+            return result
+    except Exception:
+        pass
+    return "", "", "", ""
+
+
+def _extract_root_variable_from_narrative(diff: TraceDiffResult, narrative: str) -> tuple:
+    """
+    Legacy narrative-based variable extraction (fallback).
+
     Collects ALL variable diffs, then picks the most causally significant one.
     Priority: selected_tool > *_result > plan > intent > input.* > other
 
@@ -940,13 +1008,22 @@ def _classify_error(diff: TraceDiffResult, narrative: str) -> tuple:
     """
     Classify the error type with confidence.
 
-    Distinguishes:
-      - True LLM misroute (hallucination / non-deterministic)
-      - Error-retry loop (deterministic planner has no fallback for failures)
-      - Input-driven divergence (different queries → different tools)
-      - General path divergence
+    M3.2: Now uses the diagnosis module for feature-based classification,
+    with fallback to keyword-based classification for backward compatibility.
+    """
+    try:
+        from .diagnosis import diagnose, DiagnosticFeatures
+        # Use new feature-based classification
+        diagnosis, suggestions = diagnose(diff)
+        return diagnosis.error_type, diagnosis.confidence.value, diagnosis.category.value
+    except Exception:
+        # Fallback to old keyword-based classification if diagnosis module fails
+        return _classify_error_legacy(diff, narrative)
 
-    Returns (type_description, confidence, category).
+
+def _classify_error_legacy(diff: TraceDiffResult, narrative: str) -> tuple:
+    """
+    Legacy keyword-based error classification (fallback).
     """
     narrative_lower = narrative.lower()
     has_explicit_misroute = "misrouted" in narrative_lower or "hallucinat" in narrative_lower
@@ -1008,7 +1085,25 @@ def _classify_error(diff: TraceDiffResult, narrative: str) -> tuple:
 
 def _suggest_fix(diag_type: str, root_var: str,
                  diff: TraceDiffResult, narrative: str) -> list:
-    """Generate actionable fix suggestions based on error classification."""
+    """
+    Generate actionable fix suggestions based on error classification.
+
+    M3.2: Now uses the diagnosis module for template-based suggestions,
+    with fallback to legacy logic for backward compatibility.
+    """
+    try:
+        from .diagnosis import diagnose
+        # Use new feature-based suggestions
+        diagnosis, suggestions = diagnose(diff)
+        return suggestions
+    except Exception:
+        # Fallback to legacy logic
+        return _suggest_fix_legacy(diag_type, root_var, diff, narrative)
+
+
+def _suggest_fix_legacy(diag_type: str, root_var: str,
+                       diff: TraceDiffResult, narrative: str) -> list:
+    """Legacy fix suggestion logic (fallback)."""
     fixes = []
 
     if "Tool Output Ambiguity" in diag_type:

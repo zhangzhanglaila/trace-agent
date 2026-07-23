@@ -1,30 +1,30 @@
 {
-  "verdict": "`weather_current_result` diverged (`{'city': 'Tokyo', 'error': False, 'temp': 22, '...` vs `{'city': 'Paris', 'error': False, 'temp': 14, '...`) but both runs converged to similar results via different paths.",
+  "verdict": "Run B failed because `weather_result` = `{'city': 'Mars', 'temp': 0, 'condition': '', 'h...` (vs `{'city': 'Tokyo', 'temp': 22, 'condition': 'sun...` in Run A) — this single variable change cascaded into a degraded final output.",
   "diagnosis": {
-    "type": "Minor Path Variation",
-    "confidence": "Low",
-    "category": "General"
+    "type": "Tool Output Ambiguity → Wrong Default",
+    "confidence": "High",
+    "category": "Edge Case Handling"
   },
   "root_cause": {
-    "variable": "weather_current_result",
-    "run_a": "{'city': 'Tokyo', 'error': False, 'temp': 22, '...",
-    "run_b": "{'city': 'Paris', 'error': False, 'temp': 14, '...",
-    "source": "tool `weather_current` output"
+    "variable": "weather_result",
+    "run_a": "{'city': 'Tokyo', 'temp': 22, 'condition': 'sun...",
+    "run_b": "{'city': 'Mars', 'temp': 0, 'condition': '', 'h...",
+    "source": "tool `weather` output"
   },
   "graph": {
     "nodes": [
       {
         "id": "chain_1",
-        "name": "[CHAIN] TravelPlanner",
+        "name": "[CHAIN] LangChainTravelAgent",
         "type": "tool",
-        "label": "[CHAIN] TravelPlanner",
+        "label": "[CHAIN] LangChainTravelAgent",
         "status": "success",
         "inputs": {},
         "outputs": {
           "raw": "['_', '_']"
         },
         "error": null,
-        "latency_ms": 0.0,
+        "latency_ms": 8.545398712158203,
         "diverged": false,
         "step_index": 0
       },
@@ -61,45 +61,7 @@
         "step_index": 2
       },
       {
-        "id": "llm_4",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "inputs": {
-          "prompt": ""
-        },
-        "outputs": {
-          "result": "{\"tool\": \"weather_current\", \"args\": {\"city\": \"tokyo\"}, \"reason\": \"No weather data yet, fetching weather for tokyo\"}"
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": false,
-        "step_index": 3
-      },
-      {
-        "id": "decision_5",
-        "name": "[Decision] route_to_weather_current",
-        "type": "tool",
-        "label": "[Decision] route_to_weather_current",
-        "status": "success",
-        "inputs": {
-          "condition": "route_to_weather_current",
-          "expected_value": true
-        },
-        "outputs": {
-          "branch_to": [
-            "execute_weather_current",
-            "try_alternative"
-          ]
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": false,
-        "step_index": 4
-      },
-      {
-        "id": "tool_6",
+        "id": "tool_4",
         "name": "[TOOL] weather_current",
         "type": "tool",
         "label": "[TOOL] weather_current",
@@ -107,22 +69,57 @@
         "inputs": {
           "tool": "weather_current",
           "args": {
-            "args": {
-              "city": "tokyo"
-            },
-            "plan_reason": "No weather data yet, fetching weather for tokyo"
+            "city": "Mars"
           }
         },
         "outputs": {
           "result": {
-            "city": "Tokyo",
-            "error": false,
-            "temp": 22,
-            "condition": "sunny",
-            "humidity": 55,
-            "wind_kmh": 8,
-            "season": "spring"
+            "city": "Mars",
+            "temp": 0,
+            "condition": "",
+            "humidity": 0,
+            "found": false,
+            "confidence": "low",
+            "needs_clarification": true
           }
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": true,
+        "step_index": 3
+      },
+      {
+        "id": "llm_5",
+        "name": "[LLM] decide_activity_type",
+        "type": "llm",
+        "label": "LLM: [LLM] decide_activity_type",
+        "status": "success",
+        "inputs": {
+          "prompt": ""
+        },
+        "outputs": {
+          "result": "outdoor"
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": false,
+        "step_index": 4
+      },
+      {
+        "id": "decision_6",
+        "name": "[Decision] decide_outdoor_vs_indoor",
+        "type": "tool",
+        "label": "[Decision] decide_outdoor_vs_indoor",
+        "status": "success",
+        "inputs": {
+          "condition": "decide_outdoor_vs_indoor",
+          "expected_value": true
+        },
+        "outputs": {
+          "branch_to": [
+            "search_outdoor_activities",
+            "search_indoor_activities"
+          ]
         },
         "error": null,
         "latency_ms": 0.0,
@@ -130,37 +127,52 @@
         "step_index": 5
       },
       {
-        "id": "llm_7",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
+        "id": "tool_7",
+        "name": "[TOOL] search_activities",
+        "type": "tool",
+        "label": "[TOOL] search_activities",
         "status": "success",
         "inputs": {
-          "prompt": ""
+          "tool": "search_activities",
+          "args": {
+            "destination": "Mars",
+            "activity_type": "outdoor"
+          }
         },
         "outputs": {
-          "result": "{\"tool\": \"activity_search\", \"args\": {\"activity\": \"hiking\", \"condition\": \"sunny\", \"temp\": 22}, \"reason\": \"Weather obtained (sunny, 22C), searching hiking activities\"}"
+          "result": {
+            "destination": "Mars",
+            "activity_type": "outdoor",
+            "recommendation": "Generic outdoor options available in Mars.",
+            "found": false
+          }
         },
         "error": null,
         "latency_ms": 0.0,
-        "diverged": false,
+        "diverged": true,
         "step_index": 6
       },
       {
-        "id": "decision_8",
-        "name": "[Decision] route_to_activity_search",
+        "id": "tool_8",
+        "name": "[TOOL] search_hotels",
         "type": "tool",
-        "label": "[Decision] route_to_activity_search",
+        "label": "[TOOL] search_hotels",
         "status": "success",
         "inputs": {
-          "condition": "route_to_activity_search",
-          "expected_value": true
+          "tool": "search_hotels",
+          "args": {
+            "destination": "Mars"
+          }
         },
         "outputs": {
-          "branch_to": [
-            "execute_activity_search",
-            "try_alternative"
-          ]
+          "result": {
+            "destination": "Mars",
+            "hotels": [
+              "Generic hotel in Mars"
+            ],
+            "count": 1,
+            "found": false
+          }
         },
         "error": null,
         "latency_ms": 0.0,
@@ -169,28 +181,24 @@
       },
       {
         "id": "tool_9",
-        "name": "[TOOL] activity_search",
+        "name": "[TOOL] safety_check",
         "type": "tool",
-        "label": "[TOOL] activity_search",
+        "label": "[TOOL] safety_check",
         "status": "success",
         "inputs": {
-          "tool": "activity_search",
+          "tool": "safety_check",
           "args": {
-            "args": {
-              "activity": "hiking",
-              "condition": "sunny",
-              "temp": 22
-            },
-            "plan_reason": "Weather obtained (sunny, 22C), searching hiking activities"
+            "activity_type": "outdoor",
+            "weather_condition": ""
           }
         },
         "outputs": {
           "result": {
-            "activity": "hiking",
-            "condition": "sunny",
-            "temp": 22,
-            "recommendation": "Excellent hiking weather. Trails are dry and visible. Recommended route: Mount Takao (3h).",
-            "found": true
+            "activity_type": "outdoor",
+            "weather_condition": "",
+            "note": "UNKNOWN: cannot assess outdoor safety without weather data.",
+            "safe": true,
+            "level": "caution"
           }
         },
         "error": null,
@@ -199,155 +207,10 @@
         "step_index": 8
       },
       {
-        "id": "llm_10",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "inputs": {
-          "prompt": ""
-        },
-        "outputs": {
-          "result": "{\"tool\": \"safety_check\", \"args\": {\"activity\": \"hiking\", \"condition\": \"sunny\"}, \"reason\": \"Weather + activity done, checking safety for hiking\"}"
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": false,
-        "step_index": 9
-      },
-      {
-        "id": "decision_11",
-        "name": "[Decision] route_to_safety_check",
+        "id": "chain_10",
+        "name": "[CHAIN] build_plan",
         "type": "tool",
-        "label": "[Decision] route_to_safety_check",
-        "status": "success",
-        "inputs": {
-          "condition": "route_to_safety_check",
-          "expected_value": true
-        },
-        "outputs": {
-          "branch_to": [
-            "execute_safety_check",
-            "try_alternative"
-          ]
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": true,
-        "step_index": 10
-      },
-      {
-        "id": "tool_12",
-        "name": "[TOOL] safety_check",
-        "type": "tool",
-        "label": "[TOOL] safety_check",
-        "status": "success",
-        "inputs": {
-          "tool": "safety_check",
-          "args": {
-            "args": {
-              "activity": "hiking",
-              "condition": "sunny"
-            },
-            "plan_reason": "Weather + activity done, checking safety for hiking"
-          }
-        },
-        "outputs": {
-          "result": {
-            "activity": "hiking",
-            "condition": "sunny",
-            "warning": "Safe. Bring water and sunscreen.",
-            "safe": true,
-            "level": "safe"
-          }
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": true,
-        "step_index": 11
-      },
-      {
-        "id": "llm_13",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "inputs": {
-          "prompt": ""
-        },
-        "outputs": {
-          "result": "{\"tool\": \"summarize\", \"args\": {\"plan\": {\"city\": \"Tokyo\", \"weather\": {\"city\": \"Tokyo\", \"error\": false, \"temp\": 22, \"condition\": \"sunny\", \"humidity\": 55, \"wind_kmh\": 8, \"season\": \"spring\"}, \"activities\": [{\"activity\": \"hiking\", \"condition\": \"sunny\", \"temp\": 22, \"recommendation\": \"Excellent hiking weat..."
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": false,
-        "step_index": 12
-      },
-      {
-        "id": "decision_14",
-        "name": "[Decision] route_to_summarize",
-        "type": "tool",
-        "label": "[Decision] route_to_summarize",
-        "status": "success",
-        "inputs": {
-          "condition": "route_to_summarize",
-          "expected_value": true
-        },
-        "outputs": {
-          "branch_to": [
-            "execute_summarize",
-            "try_alternative"
-          ]
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": true,
-        "step_index": 13
-      },
-      {
-        "id": "tool_15",
-        "name": "[TOOL] summarize",
-        "type": "tool",
-        "label": "[TOOL] summarize",
-        "status": "success",
-        "inputs": {
-          "tool": "summarize",
-          "args": "{'args': {'plan': {'city': 'Tokyo', 'weather': {'city': 'Tokyo', 'error': False, 'temp': 22, 'condition': 'sunny', 'humidity': 55, 'wind_kmh': 8, 'season': 'spring'}, 'activities': [{'activity': 'hiking', 'condition': 'sunny', 'temp': 22, 'recommendation': 'Excellent hiking weather. Trails are dry a..."
-        },
-        "outputs": {
-          "result": "{'summary': 'Travel Plan for Tokyo\\nWeather: 22C, sunny\\nActivities:\\n  - hiking: Excellent hiking weather. Trails are dry and visible. Recommended route: Mount Takao (3h).\\nSafety: Safe. Bring water and sunscreen.', 'plan': {'city': 'Tokyo', 'weather': {'city': 'Tokyo', 'error': False, 'temp': 22, ..."
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": true,
-        "step_index": 14
-      },
-      {
-        "id": "tool_16",
-        "name": "[TOOL] memory_store",
-        "type": "tool",
-        "label": "[TOOL] memory_store",
-        "status": "success",
-        "inputs": {
-          "tool": "memory_store",
-          "args": {
-            "key": "last_plan",
-            "value": "Travel Plan for Tokyo\nWeather: 22C, sunny\nActivities:\n  - hiking: Excellent hiking weather. Trails are dry and visible. Recommended route: Mount Takao (3h).\nSafety: Safe. Bring water and sunscreen."
-          }
-        },
-        "outputs": {
-          "result": "stored"
-        },
-        "error": null,
-        "latency_ms": 0.0,
-        "diverged": false,
-        "step_index": 15
-      },
-      {
-        "id": "output_17",
-        "name": "[OUTPUT] output",
-        "type": "output",
-        "label": "Output",
+        "label": "[CHAIN] build_plan",
         "status": "success",
         "inputs": {},
         "outputs": {
@@ -356,7 +219,26 @@
         "error": null,
         "latency_ms": 0.0,
         "diverged": false,
-        "step_index": 16
+        "step_index": 9
+      },
+      {
+        "id": "output_11",
+        "name": "[OUTPUT] output",
+        "type": "output",
+        "label": "Output",
+        "status": "success",
+        "inputs": {
+          "var": "",
+          "result": "[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data."
+        },
+        "outputs": {
+          "value": "[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data."
+        },
+        "error": null,
+        "latency_ms": 0.0,
+        "diverged": true,
+        "step_index": 10,
+        "is_divergence_point": true
       }
     ],
     "edges": [
@@ -374,96 +256,60 @@
       },
       {
         "source": "llm_3",
-        "target": "llm_4",
+        "target": "tool_4",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "llm_4",
-        "target": "decision_5",
+        "source": "tool_4",
+        "target": "llm_5",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "decision_5",
-        "target": "tool_6",
+        "source": "llm_5",
+        "target": "decision_6",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "tool_6",
-        "target": "llm_7",
+        "source": "decision_6",
+        "target": "tool_7",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "llm_7",
-        "target": "decision_8",
+        "source": "tool_7",
+        "target": "tool_8",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "decision_8",
+        "source": "tool_8",
         "target": "tool_9",
         "type": "sequential",
         "style": "solid"
       },
       {
         "source": "tool_9",
-        "target": "llm_10",
+        "target": "chain_10",
         "type": "sequential",
         "style": "solid"
       },
       {
-        "source": "llm_10",
-        "target": "decision_11",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "decision_11",
-        "target": "tool_12",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "tool_12",
-        "target": "llm_13",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "llm_13",
-        "target": "decision_14",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "decision_14",
-        "target": "tool_15",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "tool_15",
-        "target": "tool_16",
-        "type": "sequential",
-        "style": "solid"
-      },
-      {
-        "source": "tool_16",
-        "target": "output_17",
+        "source": "chain_10",
+        "target": "output_11",
         "type": "sequential",
         "style": "solid"
       }
     ],
-    "primary_run": "run_a",
+    "primary_run": "run_b",
     "secondary_nodes": [
       {
         "id": "chain_1",
-        "name": "[CHAIN] TravelPlanner",
+        "name": "[CHAIN] LangChainTravelAgent",
         "type": "tool",
-        "label": "[CHAIN] TravelPlanner",
+        "label": "[CHAIN] LangChainTravelAgent",
         "status": "success",
         "error": null
       },
@@ -484,23 +330,7 @@
         "error": null
       },
       {
-        "id": "llm_4",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "decision_5",
-        "name": "[Decision] route_to_weather_current",
-        "type": "tool",
-        "label": "[Decision] route_to_weather_current",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "tool_6",
+        "id": "tool_4",
         "name": "[TOOL] weather_current",
         "type": "tool",
         "label": "[TOOL] weather_current",
@@ -508,87 +338,55 @@
         "error": null
       },
       {
-        "id": "llm_7",
-        "name": "[LLM] planner_llm",
+        "id": "llm_5",
+        "name": "[LLM] decide_activity_type",
         "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
+        "label": "LLM: [LLM] decide_activity_type",
         "status": "success",
         "error": null
       },
       {
-        "id": "decision_8",
-        "name": "[Decision] route_to_summarize",
+        "id": "decision_6",
+        "name": "[Decision] decide_outdoor_vs_indoor",
         "type": "tool",
-        "label": "[Decision] route_to_summarize",
+        "label": "[Decision] decide_outdoor_vs_indoor",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "tool_7",
+        "name": "[TOOL] search_activities",
+        "type": "tool",
+        "label": "[TOOL] search_activities",
+        "status": "success",
+        "error": null
+      },
+      {
+        "id": "tool_8",
+        "name": "[TOOL] search_hotels",
+        "type": "tool",
+        "label": "[TOOL] search_hotels",
         "status": "success",
         "error": null
       },
       {
         "id": "tool_9",
-        "name": "[TOOL] summarize",
+        "name": "[TOOL] safety_check",
         "type": "tool",
-        "label": "[TOOL] summarize",
+        "label": "[TOOL] safety_check",
         "status": "success",
         "error": null
       },
       {
-        "id": "llm_10",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "decision_11",
-        "name": "[Decision] route_to_summarize",
+        "id": "chain_10",
+        "name": "[CHAIN] build_plan",
         "type": "tool",
-        "label": "[Decision] route_to_summarize",
+        "label": "[CHAIN] build_plan",
         "status": "success",
         "error": null
       },
       {
-        "id": "tool_12",
-        "name": "[TOOL] summarize",
-        "type": "tool",
-        "label": "[TOOL] summarize",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "llm_13",
-        "name": "[LLM] planner_llm",
-        "type": "llm",
-        "label": "LLM: [LLM] planner_llm",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "decision_14",
-        "name": "[Decision] route_to_summarize",
-        "type": "tool",
-        "label": "[Decision] route_to_summarize",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "tool_15",
-        "name": "[TOOL] summarize",
-        "type": "tool",
-        "label": "[TOOL] summarize",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "tool_16",
-        "name": "[TOOL] memory_store",
-        "type": "tool",
-        "label": "[TOOL] memory_store",
-        "status": "success",
-        "error": null
-      },
-      {
-        "id": "output_17",
+        "id": "output_11",
         "name": "[OUTPUT] output",
         "type": "output",
         "label": "Output",
@@ -599,15 +397,15 @@
   },
   "diff": {
     "first_divergence": {
-      "type": "branch",
-      "id": "route_to_activity_search",
-      "description": "Decision 'route_to_activity_search' evaluated differently: run_a took 'true' path, run_b took 'none' path",
-      "run_a": "true",
-      "run_b": "none"
+      "type": "value",
+      "id": "[OUTPUT] output",
+      "description": "Step '[OUTPUT] output' produced different results: run_a → {value=[OK] Tokyo: Weather: sunny, 22C, humidity 55%; Activities (outdoor): Mount Takao}, run_b → {value=[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data.}",
+      "run_a": "{value=[OK] Tokyo: Weather: sunny, 22C, humidity 55%; Activities (outdoor): Mount Takao}",
+      "run_b": "{value=[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data.}"
     },
     "step_diffs": [
       {
-        "step_name": "[CHAIN] TravelPlanner",
+        "step_name": "[CHAIN] LangChainTravelAgent",
         "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
@@ -616,25 +414,7 @@
         "diverged": false
       },
       {
-        "step_name": "[Decision] route_to_activity_search",
-        "only_in": "run_a",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": true
-      },
-      {
-        "step_name": "[Decision] route_to_safety_check",
-        "only_in": "run_a",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": true
-      },
-      {
-        "step_name": "[Decision] route_to_summarize",
+        "step_name": "[CHAIN] build_plan",
         "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
@@ -643,25 +423,7 @@
         "diverged": false
       },
       {
-        "step_name": "[Decision] route_to_summarize",
-        "only_in": "run_b",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": true
-      },
-      {
-        "step_name": "[Decision] route_to_summarize",
-        "only_in": "run_b",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": true
-      },
-      {
-        "step_name": "[Decision] route_to_weather_current",
+        "step_name": "[Decision] decide_outdoor_vs_indoor",
         "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
@@ -688,34 +450,7 @@
         "diverged": false
       },
       {
-        "step_name": "[LLM] planner_llm",
-        "only_in": null,
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": false
-      },
-      {
-        "step_name": "[LLM] planner_llm",
-        "only_in": null,
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": false
-      },
-      {
-        "step_name": "[LLM] planner_llm",
-        "only_in": null,
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": false
-      },
-      {
-        "step_name": "[LLM] planner_llm",
+        "step_name": "[LLM] decide_activity_type",
         "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
@@ -730,47 +465,20 @@
         "run_b_status": null,
         "run_a_error": null,
         "run_b_error": null,
-        "diverged": false
-      },
-      {
-        "step_name": "[TOOL] activity_search",
-        "only_in": "run_a",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
         "diverged": true
-      },
-      {
-        "step_name": "[TOOL] memory_store",
-        "only_in": null,
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": false
       },
       {
         "step_name": "[TOOL] safety_check",
-        "only_in": "run_a",
-        "run_a_status": null,
-        "run_b_status": null,
-        "run_a_error": null,
-        "run_b_error": null,
-        "diverged": true
-      },
-      {
-        "step_name": "[TOOL] summarize",
         "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
         "run_a_error": null,
         "run_b_error": null,
-        "diverged": false
+        "diverged": true
       },
       {
-        "step_name": "[TOOL] summarize",
-        "only_in": "run_b",
+        "step_name": "[TOOL] search_activities",
+        "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
         "run_a_error": null,
@@ -778,8 +486,8 @@
         "diverged": true
       },
       {
-        "step_name": "[TOOL] summarize",
-        "only_in": "run_b",
+        "step_name": "[TOOL] search_hotels",
+        "only_in": null,
         "run_a_status": null,
         "run_b_status": null,
         "run_a_error": null,
@@ -793,34 +501,13 @@
         "run_b_status": null,
         "run_a_error": null,
         "run_b_error": null,
-        "diverged": false
+        "diverged": true
       }
     ],
     "branch_diffs": [
       {
-        "branch_id": "route_to_activity_search",
-        "condition": "route_to_activity_search",
-        "run_a_path": "true",
-        "run_b_path": "none",
-        "diverged": true
-      },
-      {
-        "branch_id": "route_to_safety_check",
-        "condition": "route_to_safety_check",
-        "run_a_path": "true",
-        "run_b_path": "none",
-        "diverged": true
-      },
-      {
-        "branch_id": "route_to_summarize",
-        "condition": "route_to_summarize",
-        "run_a_path": "true",
-        "run_b_path": "true",
-        "diverged": false
-      },
-      {
-        "branch_id": "route_to_weather_current",
-        "condition": "route_to_weather_current",
+        "branch_id": "decide_outdoor_vs_indoor",
+        "condition": "decide_outdoor_vs_indoor",
         "run_a_path": "true",
         "run_b_path": "true",
         "diverged": false
@@ -835,72 +522,50 @@
       },
       {
         "index": 1,
-        "run_a": "llm",
-        "run_b": "llm",
-        "diverged": false
-      },
-      {
-        "index": 2,
         "run_a": "weather_current",
         "run_b": "weather_current",
         "diverged": false
       },
       {
-        "index": 3,
+        "index": 2,
         "run_a": "llm",
         "run_b": "llm",
         "diverged": false
       },
       {
+        "index": 3,
+        "run_a": "search_activities",
+        "run_b": "search_activities",
+        "diverged": false
+      },
+      {
         "index": 4,
-        "run_a": "activity_search",
-        "run_b": "summarize",
-        "diverged": true
+        "run_a": "search_hotels",
+        "run_b": "search_hotels",
+        "diverged": false
       },
       {
         "index": 5,
-        "run_a": "llm",
-        "run_b": "llm",
-        "diverged": true
-      },
-      {
-        "index": 6,
         "run_a": "safety_check",
-        "run_b": "summarize",
-        "diverged": true
-      },
-      {
-        "index": 7,
-        "run_a": "llm",
-        "run_b": "llm",
-        "diverged": true
-      },
-      {
-        "index": 8,
-        "run_a": "summarize",
-        "run_b": "summarize",
-        "diverged": true
-      },
-      {
-        "index": 9,
-        "run_a": "memory_store",
-        "run_b": "memory_store",
-        "diverged": true
+        "run_b": "safety_check",
+        "diverged": false
       }
     ],
     "has_diverged": true,
-    "output_diverged": false
+    "output_diverged": true
   },
   "output": {
-    "run_a": "stored",
-    "run_b": "stored",
-    "diverged": false
+    "run_a": "[OK] Tokyo: Weather: sunny, 22C, humidity 55%; Activities (outdoor): Mount Takao hiking trail (3h, moderate). Cherry blossoms i...",
+    "run_b": "[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data.",
+    "diverged": true
   },
-  "fix_suggestion": "Review the first divergence point and add a guard condition\n  Specifically at: route_to_activity_search",
+  "fix_suggestion": "Add input validation on tool outputs before routing decisions\nCheck `weather_result` for edge cases (empty, null, unexpected format)\nDefault to a safe fallback when confidence is low or data is missing",
+  "explanation": "The agent diverged at the decision point \"[OUTPUT] output\": Run A took the \"{value=[OK] Tokyo: Weather: sunny, 22C, humidity 55%; Activities (outdoor): Mount Takao}\" path, but Run B took the \"{value=[PARTIAL] Mars: UNKNOWN: cannot assess outdoor safety without weather data.}\" path. This was caused by `weather result` differing between runs (Run A had {'city': 'Tokyo', 'temp': 22, 'condition': 'sun..., Run B had {'city': 'Mars', 'temp': 0, 'condition': '', 'h...). As a result, the final outputs were different.",
   "meta": {
-    "trace_id_a": "trace_1777566721563",
-    "trace_id_b": "trace_1777566721564",
-    "run_a_steps": 17,
-    "run_b_steps": 17
+    "trace_id_a": "trace_1784781567720",
+    "trace_id_b": "trace_1784781567729",
+    "run_a_steps": 11,
+    "run_b_steps": 11,
+    "bug_enabled": true
   }
 }
